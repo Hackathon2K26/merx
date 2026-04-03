@@ -1,2 +1,20 @@
-# merx
-ETHGlobal hackathon project : merx is an application where a user creates a payment/settlement intent in USD, gets a swap quote on a Uniswap-supported source chain, executes the swap, and use Arc's Gateway to unify the USDC balance of the seller.
+# Merx
+
+Modular trading toolkit. Each subdirectory is an independent Go module.
+
+## Modules
+
+### [uniswap-api](./uniswap-api/)
+
+Go client for the [Uniswap Trading API](https://api-docs.uniswap.org/introduction). Get token prices in USDC and execute swaps on supported testnets (Ethereum Sepolia, Base Sepolia, Unichain Sepolia).
+
+See [uniswap-api/README.md](./uniswap-api/README.md) for setup and usage.
+
+## Progress
+
+- [x] Uniswap API client (quote, swap, approval)
+- [x] Multi-chain testnet support
+- [x] Unit + integration tests
+- [x] CLI tool
+- [ ] Transaction signing and broadcasting
+- [ ] UniswapX gasless order flow
