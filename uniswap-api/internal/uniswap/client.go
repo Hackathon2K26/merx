@@ -63,7 +63,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, dest any
 
 	if resp.StatusCode >= 400 {
 		var apiErr APIError
-		if jsonErr := json.Unmarshal(respBody, &apiErr); jsonErr == nil {
+		if jsonErr := json.Unmarshal(respBody, &apiErr); jsonErr == nil && (apiErr.ErrorCode != "" || apiErr.Message != "") {
 			apiErr.StatusCode = resp.StatusCode
 			return &apiErr
 		}

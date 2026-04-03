@@ -71,7 +71,7 @@ func main() {
 
 	fmt.Println("\nBuilding swap transaction...")
 	swapResp, err := client.CreateSwap(ctx, &uniswap.SwapRequest{
-		Quote: quoteResp.Quote,
+		Quote: quoteResp.RawQuote,
 	})
 	if err != nil {
 		log.Fatalf("Swap error: %v", err)

@@ -40,19 +40,21 @@ func TestGetQuote_MockServer(t *testing.T) {
 			t.Errorf("expected chainId=%d, got %d", config.EthereumSepolia.ChainID, req.TokenInChainId)
 		}
 
-		resp := QuoteResponse{
-			RequestID: "test-request-id",
-			Routing:   "CLASSIC",
-			Quote: ClassicQuote{
-				Input:       TokenAmount{Token: config.EthereumSepolia.AddressUSDC, Amount: "100000000"},
-				Output:      TokenAmount{Token: config.EthereumSepolia.AddressWETH, Amount: "55000000000000000"},
-				ChainID:     config.EthereumSepolia.ChainID,
-				TradeType:   "EXACT_INPUT",
-				RouteString: "USDC -> WETH",
-				QuoteID:     "test-quote-id",
-				GasFeeUSD:   "2.50",
-				PriceImpact: 0.01,
-			},
+		quote := ClassicQuote{
+			Input:       TokenAmount{Token: config.EthereumSepolia.AddressUSDC, Amount: "100000000"},
+			Output:      TokenAmount{Token: config.EthereumSepolia.AddressWETH, Amount: "55000000000000000"},
+			ChainID:     config.EthereumSepolia.ChainID,
+			TradeType:   "EXACT_INPUT",
+			RouteString: "USDC -> WETH",
+			QuoteID:     "test-quote-id",
+			GasFeeUSD:   "2.50",
+			PriceImpact: 0.01,
+		}
+		quoteJSON, _ := json.Marshal(quote)
+		resp := map[string]any{
+			"requestId": "test-request-id",
+			"routing":   "CLASSIC",
+			"quote":     json.RawMessage(quoteJSON),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -134,13 +136,15 @@ func TestGetPriceUSDC_MultipleChains(t *testing.T) {
 					t.Errorf("expected chainId=%d for chain %s, got %d", chain.ChainID, chain.Name, req.TokenInChainId)
 				}
 
-				resp := QuoteResponse{
-					RequestID: "test-" + chain.Name,
-					Routing:   "CLASSIC",
-					Quote: ClassicQuote{
-						Input:  TokenAmount{Token: chain.AddressUSDC, Amount: "50000000"},
-						Output: TokenAmount{Token: chain.AddressWETH, Amount: "25000000000000000"},
-					},
+				quote := ClassicQuote{
+					Input:  TokenAmount{Token: chain.AddressUSDC, Amount: "50000000"},
+					Output: TokenAmount{Token: chain.AddressWETH, Amount: "25000000000000000"},
+				}
+				quoteJSON, _ := json.Marshal(quote)
+				resp := map[string]any{
+					"requestId": "test-" + chain.Name,
+					"routing":   "CLASSIC",
+					"quote":     json.RawMessage(quoteJSON),
 				}
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(resp)

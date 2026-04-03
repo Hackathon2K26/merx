@@ -9,9 +9,36 @@ type Chain struct {
 	AddressUSDC  string
 	AddressWETH  string
 	DecimalsUSDC int
+	// Tokens maps a human-readable symbol to its contract address on this chain.
+	Tokens map[string]string
 }
 
+// Ethereum Mainnet token addresses.
+const (
+	MainnetUSDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+	MainnetWETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+	MainnetUSDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+	MainnetDAI  = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+	MainnetWBTC = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+)
+
 var (
+	// EthereumMainnet is used for forked tests only — not exposed in the CLI.
+	EthereumMainnet = &Chain{
+		Name:         "ethereum-mainnet",
+		ChainID:      1,
+		AddressUSDC:  MainnetUSDC,
+		AddressWETH:  MainnetWETH,
+		DecimalsUSDC: 6,
+		Tokens: map[string]string{
+			"USDC": MainnetUSDC,
+			"WETH": MainnetWETH,
+			"USDT": MainnetUSDT,
+			"DAI":  MainnetDAI,
+			"WBTC": MainnetWBTC,
+		},
+	}
+
 	EthereumSepolia = &Chain{
 		Name:         "ethereum-sepolia",
 		ChainID:      11155111,
@@ -36,6 +63,7 @@ var (
 		DecimalsUSDC: 6,
 	}
 
+	// supportedChains are the chains exposed in the CLI (testnets only).
 	supportedChains = map[string]*Chain{
 		"ethereum-sepolia": EthereumSepolia,
 		"base-sepolia":     BaseSepolia,

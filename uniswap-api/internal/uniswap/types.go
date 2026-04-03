@@ -1,6 +1,9 @@
 package uniswap
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // --- Quote ---
 
@@ -18,7 +21,8 @@ type QuoteRequest struct {
 
 type QuoteResponse struct {
 	RequestID         string              `json:"requestId"`
-	Quote             ClassicQuote        `json:"quote"`
+	RawQuote          json.RawMessage     `json:"quote"`
+	Quote             ClassicQuote        `json:"-"` // parsed from RawQuote
 	Routing           string              `json:"routing"`
 	PermitData        *PermitData         `json:"permitData"`
 	PermitTransaction *TransactionRequest `json:"permitTransaction,omitempty"`
@@ -66,11 +70,13 @@ type ApprovalResponse struct {
 
 // --- Swap ---
 
+// SwapRequest wraps the raw quote from the /quote response along with
+// optional Permit2 signature data. Quote is passed through as raw JSON
+// to preserve all fields the API expects.
 type SwapRequest struct {
-	Quote      ClassicQuote `json:"quote"`
-	Signature  string       `json:"signature,omitempty"`
-	PermitData *PermitData  `json:"permitData,omitempty"`
-	Urgency    string       `json:"urgency,omitempty"`
+	Quote      json.RawMessage `json:"quote"`
+	Signature  string          `json:"signature,omitempty"`
+	PermitData *PermitData     `json:"permitData,omitempty"`
 }
 
 type SwapResponse struct {
