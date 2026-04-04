@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect } from "react";
 import type { TokenEntry } from "@/types/chain";
+import { tokenIcon } from "@/lib/tokenIcons";
 
 interface TokenOption {
   token: TokenEntry;
   balance?: bigint;
-  isSwap: boolean; // true = via Uniswap, false = direct USDC
+  isSwap: boolean;
 }
 
 interface Props {
@@ -37,7 +38,7 @@ export function TokenSelector({ options, selected, onSelect, loading, formatBala
       >
         {current ? (
           <>
-            {current.isSwap && <img src="/uniswap.png" alt="" className="h-4 w-4" />}
+            <TokenIcon symbol={current.token.symbol} />
             <span className="flex-1 text-left font-medium">{current.token.symbol}</span>
             <span className="text-xs text-muted-foreground">
               {loading ? "..." : current.balance !== undefined ? formatBalance(current.balance.toString(), current.token.decimals) : ""}
@@ -63,8 +64,7 @@ export function TokenSelector({ options, selected, onSelect, loading, formatBala
                   : "text-foreground"
               }`}
             >
-              {o.isSwap && <img src="/uniswap.png" alt="" className="h-4 w-4" />}
-              {!o.isSwap && <div className="h-4 w-4" />}
+              <TokenIcon symbol={o.token.symbol} />
               <span className="flex-1 text-left font-medium">{o.token.symbol}</span>
               <span className="text-xs text-muted-foreground">
                 {loading ? "..." : o.balance !== undefined ? formatBalance(o.balance.toString(), o.token.decimals) : ""}
@@ -76,6 +76,18 @@ export function TokenSelector({ options, selected, onSelect, loading, formatBala
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function TokenIcon({ symbol }: { symbol: string }) {
+  const icon = tokenIcon(symbol);
+  if (icon) {
+    return <img src={icon} alt={symbol} className="h-5 w-5 rounded-full" />;
+  }
+  return (
+    <div className="h-5 w-5 rounded-full bg-muted flex items-center justify-center text-[9px] font-bold text-muted-foreground">
+      {symbol.slice(0, 2)}
     </div>
   );
 }

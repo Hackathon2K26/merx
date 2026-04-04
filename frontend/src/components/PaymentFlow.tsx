@@ -56,14 +56,6 @@ export function PaymentFlow({ chains, product, merchantAddress, onPaid }: Props)
   const usdcToken = chain?.tokens.find((t) => t.symbol === "USDC");
   const isDirectUSDC = selectedSymbol === "USDC";
 
-  // When invoice is created (chain selected), sync chainId and move to token selection
-  useEffect(() => {
-    if (invoice && step === "idle") {
-      setSelectedChainId(invoice.chainId);
-      setStep("select-token");
-    }
-  }, [invoice, step]);
-
   // Read balances for ALL tokens on the chain in one multicall
   const balanceContracts = allTokens.map((t) => ({
     address: t.address as Hex,
@@ -402,13 +394,20 @@ export function PaymentFlow({ chains, product, merchantAddress, onPaid }: Props)
 
           {/* Action button */}
           {isDirectUSDC ? (
-            <button
-              onClick={doGaslessUSDCPay}
-              disabled={usdcPermitPending}
-              className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
-            >
-              {usdcPermitPending ? "Sign permit in wallet..." : `Pay ${product.price} USDC (gasless)`}
-            </button>
+            <div className="space-y-2">
+              <button
+                onClick={doGaslessUSDCPay}
+                disabled={usdcPermitPending}
+                className="w-full rounded-md bg-[#2775CA] px-4 py-2.5 text-sm font-medium text-white hover:bg-[#2775CA]/90 disabled:opacity-50 transition-colors flex items-center justify-center gap-2"
+              >
+                <img src="/usdc.png" alt="" className="h-5 w-5" />
+                {usdcPermitPending ? "Sign permit in wallet..." : `Pay ${product.price} USDC (gasless)`}
+              </button>
+              <div className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
+                <img src="/circle_logo.png" alt="" className="h-3.5 w-3.5" />
+                <span>Powered by Circle</span>
+              </div>
+            </div>
           ) : (
             <button
               onClick={fetchQuote}
