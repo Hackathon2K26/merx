@@ -8,8 +8,8 @@ import (
 	"os"
 	"strings"
 
-	"merx/internal/config"
-	"merx/internal/uniswap"
+	"github.com/RomainLafont/merx/uniswap-api/config"
+	"github.com/RomainLafont/merx/uniswap-api/uniswap"
 )
 
 func main() {

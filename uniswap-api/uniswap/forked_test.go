@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"merx/internal/config"
+	"github.com/RomainLafont/merx/uniswap-api/config"
 )
 
 // loadForkedClient returns a Client configured for mainnet forked tests.

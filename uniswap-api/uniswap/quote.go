@@ -7,7 +7,7 @@ import (
 	"math/big"
 	"net/http"
 
-	"merx/internal/config"
+	"github.com/RomainLafont/merx/uniswap-api/config"
 )
 
 // GetQuote fetches a swap quote from the Uniswap Trading API.

@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"merx/internal/config"
+	"github.com/RomainLafont/merx/uniswap-api/config"
 )
 
 func TestGetQuote_MockServer(t *testing.T) {
@@ -167,7 +167,7 @@ func TestGetPriceUSDC_MultipleChains(t *testing.T) {
 // TestGetQuote_Integration hits the real Uniswap API.
 // Requires a config.yaml at the project root. Run from the project root:
 //
-//	go test ./internal/uniswap/ -run TestGetQuote_Integration -v
+//	go test ./uniswap-api/uniswap/ -run TestGetQuote_Integration -v
 func TestGetQuote_Integration(t *testing.T) {
 	cfg, err := config.Load("../../config.yaml")
 	if err != nil {
