@@ -1,4 +1,4 @@
-// Local API server exposing Gateway operations for the frontend.
+// Local API server exposing Gateway + Uniswap + Invoice operations for the frontend.
 //
 // Usage:
 //
@@ -7,19 +7,24 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	merx "github.com/RomainLafont/merx"
+	"gopkg.in/yaml.v3"
+
 	"github.com/RomainLafont/merx/gateway"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -27,23 +32,210 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/google/uuid"
 )
 
 const payWithPermitABIJSON = `[{"type":"function","name":"payWithPermit","inputs":[{"name":"owner","type":"address"},{"name":"amount","type":"uint256"},{"name":"deadline","type":"uint256"},{"name":"v","type":"uint8"},{"name":"r","type":"bytes32"},{"name":"s","type":"bytes32"},{"name":"maxFee","type":"uint256"}],"outputs":[]}]`
 
+// uniswapConfig mirrors the YAML structure in uniswap-api/config.yaml.
+type uniswapConfig struct {
+	APIKey         string `yaml:"uniswap_api_key"`
+	SwapperAddress string `yaml:"swapper_address"`
+	BaseURL        string `yaml:"base_url"`
+}
+
+func loadUniswapConfig(path string) (*uniswapConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg uniswapConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	if cfg.APIKey == "" {
+		return nil, fmt.Errorf("uniswap_api_key is required in %s", path)
+	}
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = "https://trade-api.gateway.uniswap.org/v1"
+	}
+	return &cfg, nil
+}
+
+// Testnet-only key. Address: 0x3338A40C3362e6974AA2feCC06a536FF73D6797d
+const defaultPrivateKey = "63de9a8de555c9e160c577087e4d43865f6018aeb5bf919268ed5de5d525a126"
+
 const relayAndDepositABIJSON = `[{"type":"function","name":"relayAndDeposit","inputs":[{"name":"message","type":"bytes"},{"name":"attestation","type":"bytes"},{"name":"depositor","type":"address"}],"outputs":[]}]`
 
+// ---------------------------------------------------------------------------
+// Token registry (loaded from registry.yaml)
+// ---------------------------------------------------------------------------
+
+type tokenEntry struct {
+	Symbol   string `yaml:"symbol" json:"symbol"`
+	Decimals int    `yaml:"decimals" json:"decimals"`
+	Address  string `yaml:"address" json:"address"`
+}
+
+type registryChain struct {
+	Name    string       `yaml:"name" json:"name"`
+	ChainID int          `yaml:"chainId" json:"chainId"`
+	Tokens  []tokenEntry `yaml:"tokens" json:"tokens"`
+}
+
+type registry struct {
+	Chains []registryChain `yaml:"chains"`
+}
+
+var loadedRegistry *registry
+
+func loadRegistry(path string) (*registry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var reg registry
+	if err := yaml.Unmarshal(data, &reg); err != nil {
+		return nil, err
+	}
+	return &reg, nil
+}
+
+func usdcAddressForChain(chainID int) string {
+	if loadedRegistry == nil {
+		return ""
+	}
+	for _, c := range loadedRegistry.Chains {
+		if c.ChainID == chainID {
+			for _, t := range c.Tokens {
+				if t.Symbol == "USDC" {
+					return t.Address
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Invoice store
+// ---------------------------------------------------------------------------
+
+type Invoice struct {
+	ID              string     `json:"id"`
+	MerchantAddress string     `json:"merchantAddress"`
+	Amount          string     `json:"amount"`      // base units (6 decimals)
+	AmountHuman     string     `json:"amountHuman"` // e.g. "100.00"
+	ChainID         int        `json:"chainId"`
+	Description     string     `json:"description"`
+	Status          string     `json:"status"` // pending | paid
+	TxHash          string     `json:"txHash,omitempty"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	PaidAt          *time.Time `json:"paidAt,omitempty"`
+}
+
+type invoiceStore struct {
+	mu       sync.RWMutex
+	invoices map[string]*Invoice
+}
+
+func newInvoiceStore() *invoiceStore {
+	return &invoiceStore{invoices: make(map[string]*Invoice)}
+}
+
+func (s *invoiceStore) create(inv *Invoice) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.invoices[inv.ID] = inv
+}
+
+func (s *invoiceStore) get(id string) *Invoice {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.invoices[id]
+}
+
+func (s *invoiceStore) list(merchant string) []*Invoice {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*Invoice
+	for _, inv := range s.invoices {
+		if merchant == "" || strings.EqualFold(inv.MerchantAddress, merchant) {
+			result = append(result, inv)
+		}
+	}
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// Uniswap proxy client
+// ---------------------------------------------------------------------------
+
+type uniswapProxy struct {
+	baseURL    string
+	apiKey     string
+	httpClient *http.Client
+}
+
+func newUniswapProxy(apiKey string) *uniswapProxy {
+	return &uniswapProxy{
+		baseURL:    "https://trade-api.gateway.uniswap.org/v1",
+		apiKey:     apiKey,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// forward sends a request to Uniswap API and writes the response directly.
+func (u *uniswapProxy) forward(w http.ResponseWriter, path string, body []byte) {
+	req, err := http.NewRequest(http.MethodPost, u.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "build request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("x-api-key", u.apiKey)
+
+	resp, err := u.httpClient.Do(req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "uniswap request: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
 type server struct {
-	client          *gateway.Client
-	info            *gateway.InfoResponse
-	paymasterABI    abi.ABI
-	arcReceiverABI  abi.ABI
+	client         *gateway.Client
+	info           *gateway.InfoResponse
+	paymasterABI   abi.ABI
+	arcReceiverABI abi.ABI
+	invoices       *invoiceStore
+	uniswap        *uniswapProxy
 }
 
 func main() {
 	port := flag.Int("port", 8080, "HTTP port")
 	privKeyHex := flag.String("private-key", "", "hex private key (or PRIVATE_KEY env)")
+	uniswapCfgPath := flag.String("uniswap-config", "uniswap-api/config.yaml", "path to uniswap config.yaml")
+	registryPath := flag.String("registry", "registry.yaml", "path to token registry YAML")
 	flag.Parse()
+
+	// Load token registry.
+	reg, err := loadRegistry(*registryPath)
+	if err != nil {
+		log.Fatalf("load registry: %v", err)
+	}
+	loadedRegistry = reg
+	log.Printf("loaded %d chains from registry", len(reg.Chains))
 
 	keyHex := *privKeyHex
 	if keyHex == "" {
@@ -78,9 +270,29 @@ func main() {
 		log.Fatalf("parse merx.ArcReceiver ABI: %v", err)
 	}
 
-	s := &server{client: client, info: info, paymasterABI: paymasterABI, arcReceiverABI: arcReceiverABI}
+	// Uniswap proxy.
+	var uniProxy *uniswapProxy
+	uniCfg, err := loadUniswapConfig(*uniswapCfgPath)
+	if err != nil {
+		log.Printf("warning: uniswap config not loaded (%v) — uniswap endpoints disabled", err)
+	} else {
+		uniProxy = newUniswapProxy(uniCfg.APIKey)
+		uniProxy.baseURL = uniCfg.BaseURL
+		log.Println("uniswap proxy enabled")
+	}
+
+	s := &server{
+		client:         client,
+		info:           info,
+		paymasterABI:   paymasterABI,
+		arcReceiverABI: arcReceiverABI,
+		invoices:       newInvoiceStore(),
+		uniswap:        uniProxy,
+	}
 
 	mux := http.NewServeMux()
+
+	// Gateway endpoints.
 	mux.HandleFunc("GET /api/info", s.handleInfo)
 	mux.HandleFunc("GET /api/balances", s.handleBalances)
 	mux.HandleFunc("GET /api/pay-tx", s.handlePayTx)
@@ -88,18 +300,216 @@ func main() {
 	mux.HandleFunc("POST /api/refund", s.handleRefund)
 	mux.HandleFunc("GET /api/refund/{id}", s.handleRefundStatus)
 
+	// Chain info.
+	mux.HandleFunc("GET /api/chains", s.handleChains)
+
+	// Invoice endpoints.
+	mux.HandleFunc("POST /api/invoices", s.handleCreateInvoice)
+	mux.HandleFunc("GET /api/invoices", s.handleListInvoices)
+	mux.HandleFunc("GET /api/invoices/{id}", s.handleGetInvoice)
+	mux.HandleFunc("POST /api/invoices/{id}/pay", s.handlePayInvoice)
+
+	// Uniswap proxy endpoints.
+	mux.HandleFunc("POST /api/uniswap/quote", s.handleUniswapQuote)
+	mux.HandleFunc("POST /api/uniswap/approval", s.handleUniswapApproval)
+	mux.HandleFunc("POST /api/uniswap/swap", s.handleUniswapSwap)
+
 	log.Printf("signer: %s", client.SignerAddress())
 	log.Printf("listening on :%d", *port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), logRequests(cors(mux))))
 }
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Chain handler
 // ---------------------------------------------------------------------------
 
-// GET /api/info — Gateway domains, contracts, processed heights.
+func (s *server) handleChains(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, loadedRegistry.Chains)
+}
+
+// ---------------------------------------------------------------------------
+// Invoice handlers
+// ---------------------------------------------------------------------------
+
+type createInvoiceRequest struct {
+	MerchantAddress string `json:"merchantAddress"`
+	Amount          string `json:"amount"` // human-readable e.g. "100.50"
+	ChainID         int    `json:"chainId"`
+	Description     string `json:"description"`
+}
+
+func (s *server) handleCreateInvoice(w http.ResponseWriter, r *http.Request) {
+	var req createInvoiceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: %v", err)
+		return
+	}
+	if req.MerchantAddress == "" || req.Amount == "" || req.ChainID == 0 {
+		writeError(w, http.StatusBadRequest, "merchantAddress, amount, and chainId are required")
+		return
+	}
+
+	// Parse human-readable amount and convert to base units (6 decimals).
+	amountFloat, ok := new(big.Float).SetString(req.Amount)
+	if !ok || amountFloat.Sign() <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid amount: %s", req.Amount)
+		return
+	}
+	multiplier := new(big.Float).SetInt64(1_000_000)
+	baseUnits, _ := new(big.Float).Mul(amountFloat, multiplier).Int(nil)
+
+	inv := &Invoice{
+		ID:              uuid.New().String(),
+		MerchantAddress: req.MerchantAddress,
+		Amount:          baseUnits.String(),
+		AmountHuman:     req.Amount,
+		ChainID:         req.ChainID,
+		Description:     req.Description,
+		Status:          "pending",
+		CreatedAt:       time.Now(),
+	}
+	s.invoices.create(inv)
+
+	log.Printf("invoice created: id=%s merchant=%s amount=%s USDC chain=%d", inv.ID, inv.MerchantAddress, inv.AmountHuman, inv.ChainID)
+	writeJSON(w, http.StatusCreated, inv)
+}
+
+func (s *server) handleListInvoices(w http.ResponseWriter, r *http.Request) {
+	merchant := r.URL.Query().Get("merchant")
+	invoices := s.invoices.list(merchant)
+	if invoices == nil {
+		invoices = []*Invoice{}
+	}
+	writeJSON(w, http.StatusOK, invoices)
+}
+
+func (s *server) handleGetInvoice(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	inv := s.invoices.get(id)
+	if inv == nil {
+		writeError(w, http.StatusNotFound, "invoice not found: %s", id)
+		return
+	}
+	writeJSON(w, http.StatusOK, inv)
+}
+
+type payInvoiceRequest struct {
+	TxHash string `json:"txHash"`
+}
+
+func (s *server) handlePayInvoice(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	inv := s.invoices.get(id)
+	if inv == nil {
+		writeError(w, http.StatusNotFound, "invoice not found: %s", id)
+		return
+	}
+
+	var req payInvoiceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: %v", err)
+		return
+	}
+	if req.TxHash == "" {
+		writeError(w, http.StatusBadRequest, "txHash is required")
+		return
+	}
+
+	s.invoices.mu.Lock()
+	inv.Status = "paid"
+	inv.TxHash = req.TxHash
+	now := time.Now()
+	inv.PaidAt = &now
+	s.invoices.mu.Unlock()
+
+	log.Printf("invoice paid: id=%s txHash=%s", id, req.TxHash)
+	writeJSON(w, http.StatusOK, inv)
+}
+
+// ---------------------------------------------------------------------------
+// Uniswap proxy handlers
+// ---------------------------------------------------------------------------
+
+type uniswapQuoteRequest struct {
+	TokenIn        string `json:"tokenIn"`
+	TokenInChainId int    `json:"tokenInChainId"`
+	Amount         string `json:"amount"` // USDC amount in base units (EXACT_OUTPUT)
+	Swapper        string `json:"swapper"`
+}
+
+func (s *server) handleUniswapQuote(w http.ResponseWriter, r *http.Request) {
+	if s.uniswap == nil {
+		writeError(w, http.StatusServiceUnavailable, "uniswap not configured")
+		return
+	}
+
+	var req uniswapQuoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: %v", err)
+		return
+	}
+	if req.TokenIn == "" || req.TokenInChainId == 0 || req.Amount == "" || req.Swapper == "" {
+		writeError(w, http.StatusBadRequest, "tokenIn, tokenInChainId, amount, and swapper are required")
+		return
+	}
+
+	usdcAddr := usdcAddressForChain(req.TokenInChainId)
+	if usdcAddr == "" {
+		writeError(w, http.StatusBadRequest, "unsupported chain: %d", req.TokenInChainId)
+		return
+	}
+
+	// Build full Uniswap quote request.
+	// Force CLASSIC routing (V2/V3/V4) so the quote works with /swap.
+	// DutchQuotes (UniswapX) require /order instead and aren't supported here.
+	fullReq := map[string]any{
+		"type":              "EXACT_OUTPUT",
+		"amount":            req.Amount,
+		"tokenIn":           req.TokenIn,
+		"tokenOut":          usdcAddr,
+		"tokenInChainId":    req.TokenInChainId,
+		"tokenOutChainId":   req.TokenInChainId,
+		"swapper":           req.Swapper,
+		"slippageTolerance": 0.5,
+		"protocols":         []string{"V2", "V3", "V4"},
+	}
+	body, _ := json.Marshal(fullReq)
+	s.uniswap.forward(w, "/quote", body)
+}
+
+func (s *server) handleUniswapApproval(w http.ResponseWriter, r *http.Request) {
+	if s.uniswap == nil {
+		writeError(w, http.StatusServiceUnavailable, "uniswap not configured")
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read body: %v", err)
+		return
+	}
+	s.uniswap.forward(w, "/check_approval", body)
+}
+
+func (s *server) handleUniswapSwap(w http.ResponseWriter, r *http.Request) {
+	if s.uniswap == nil {
+		writeError(w, http.StatusServiceUnavailable, "uniswap not configured")
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read body: %v", err)
+		return
+	}
+	s.uniswap.forward(w, "/swap", body)
+}
+
+// ---------------------------------------------------------------------------
+// Gateway handlers
+// ---------------------------------------------------------------------------
+
 func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
-	// Refresh info on each call.
 	info, err := s.client.GetInfo(r.Context())
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "GetInfo: %v", err)
@@ -109,7 +519,6 @@ func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
-// GET /api/balances — shop's Gateway balances across all domains.
 func (s *server) handleBalances(w http.ResponseWriter, r *http.Request) {
 	bal, err := s.client.GetBalances(r.Context(), &gateway.BalancesRequest{
 		Token:   "USDC",
@@ -469,8 +878,6 @@ type refundResponse struct {
 	Fees       gateway.Fees `json:"fees"`
 }
 
-// POST /api/refund — start a refund. Returns immediately with a transferId.
-// The frontend polls GET /api/refund/{id} for status.
 func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
 	var req refundRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -492,7 +899,6 @@ func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
 	recipient := common.HexToAddress(req.To)
 	ctx := r.Context()
 
-	// Balances.
 	bal, err := s.client.GetBalances(ctx, &gateway.BalancesRequest{
 		Token:   "USDC",
 		Sources: []gateway.BalanceSource{{Depositor: s.client.SignerAddress().Hex()}},
@@ -502,7 +908,6 @@ func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Allocate sources.
 	allocs := gateway.AllocateBalances(bal.Balances, amount, req.Chain, -1)
 	if allocs == nil {
 		writeError(w, http.StatusConflict, "insufficient Gateway balance for %s USDC", amount)
@@ -521,7 +926,6 @@ func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build intents.
 	var intents []gateway.BurnIntent
 	for _, a := range allocs {
 		srcDomain := s.info.LookupDomain(a.Domain)
@@ -560,7 +964,6 @@ func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sign each filled intent.
 	var signed []gateway.SignedBurnIntentRequest
 	for i := range est.Body {
 		filled := est.Body[i].BurnIntent
@@ -598,7 +1001,6 @@ func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GET /api/refund/{id} — poll refund status.
 func (s *server) handleRefundStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -704,7 +1106,7 @@ func logRequests(next http.Handler) http.Handler {
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -727,4 +1129,3 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
-
