@@ -1,7 +1,6 @@
 chains:
   - name: Ethereum Sepolia
     chainId: 11155111
-    gatewayDomain: 0
     rpc: "https://ethereum-sepolia-rpc.publicnode.com"
     tokens:
       - symbol: USDC
@@ -16,7 +15,6 @@ chains:
 
   - name: Base Sepolia
     chainId: 84532
-    gatewayDomain: 6
     rpc: "https://base-sepolia-rpc.publicnode.com"
     tokens:
       - symbol: USDC
@@ -28,7 +26,6 @@ chains:
 
   - name: Unichain Sepolia
     chainId: 1301
-    gatewayDomain: 10
     rpc: "https://sepolia.unichain.org"
     tokens:
       - symbol: USDC

@@ -23,10 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"crypto/ecdsa"
-
 	merx "github.com/RomainLafont/merx"
-	"github.com/RomainLafont/merx/gateway"
 	"gopkg.in/yaml.v3"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -65,6 +62,9 @@ func loadUniswapConfig(path string) (*uniswapConfig, error) {
 	return &cfg, nil
 }
 
+// Merchant wallet key. Address: 0x3338A40C3362e6974AA2feCC06a536FF73D6797d
+const defaultPrivateKey = "63de9a8de555c9e160c577087e4d43865f6018aeb5bf919268ed5de5d525a126"
+
 const depositForBurnABIJSON = `[{"type":"function","name":"depositForBurn","inputs":[{"name":"amount","type":"uint256"},{"name":"destinationDomain","type":"uint32"},{"name":"mintRecipient","type":"bytes32"},{"name":"burnToken","type":"address"},{"name":"destinationCaller","type":"bytes32"},{"name":"maxFee","type":"uint256"},{"name":"minFinalityThreshold","type":"uint32"}],"outputs":[]}]`
 
 const receiveMessageABIJSON = `[{"type":"function","name":"receiveMessage","inputs":[{"name":"message","type":"bytes"},{"name":"attestation","type":"bytes"}],"outputs":[{"name":"success","type":"bool"}]}]`
@@ -84,7 +84,6 @@ type tokenEntry struct {
 type registryChain struct {
 	Name          string       `yaml:"name" json:"name"`
 	ChainID       int          `yaml:"chainId" json:"chainId"`
-	GatewayDomain int          `yaml:"gatewayDomain" json:"gatewayDomain"`
 	RPC           string       `yaml:"rpc" json:"-"` // not exposed to frontend
 	Tokens        []tokenEntry `yaml:"tokens" json:"tokens"`
 }
@@ -222,6 +221,7 @@ func (u *uniswapProxy) forward(w http.ResponseWriter, path string, body []byte) 
 type server struct {
 	key               *ecdsa.PrivateKey
 	signer            common.Address
+	arcOperatorKey    *ecdsa.PrivateKey // operator on ArcReceiver (0x2A94...)
 	paymasterABI      abi.ABI
 	depositForBurnABI abi.ABI
 	receiveMessageABI abi.ABI
@@ -298,6 +298,7 @@ func main() {
 	s := &server{
 		key:               key,
 		signer:            signer,
+		arcOperatorKey:    arcOpKey,
 		paymasterABI:      paymasterABI,
 		depositForBurnABI: depositForBurnABI,
 		receiveMessageABI: receiveMessageABI,
@@ -310,7 +311,6 @@ func main() {
 
 	// CCTP endpoints.
 	mux.HandleFunc("GET /api/balances", s.handleBalances)
-	mux.HandleFunc("GET /api/gateway/balances", s.handleGatewayBalances)
 	mux.HandleFunc("GET /api/pay-tx", s.handlePayTx)
 	mux.HandleFunc("POST /api/pay", s.handlePay)
 	mux.HandleFunc("POST /api/refund", s.handleRefund)
@@ -324,6 +324,9 @@ func main() {
 	mux.HandleFunc("GET /api/invoices", s.handleListInvoices)
 	mux.HandleFunc("GET /api/invoices/{id}", s.handleGetInvoice)
 	mux.HandleFunc("POST /api/invoices/{id}/pay", s.handlePayInvoice)
+
+	// Dashboard.
+	mux.HandleFunc("GET /api/merchant/balances", s.handleMerchantBalances)
 
 	// Uniswap proxy endpoints.
 	mux.HandleFunc("POST /api/uniswap/quote", s.handleUniswapQuote)
@@ -341,6 +344,111 @@ func main() {
 
 func (s *server) handleChains(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, loadedRegistry.Chains)
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard: merchant balances across all chains
+// ---------------------------------------------------------------------------
+
+type chainBalance struct {
+	Chain   string `json:"chain"`
+	ChainID int    `json:"chainId"`
+	Balance string `json:"balance"` // base units (6 decimals)
+}
+
+// GET /api/merchant/balances — USDC balances on all chains + Arc.
+func (s *server) handleMerchantBalances(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	balABI, _ := abi.JSON(strings.NewReader(balanceOfABIJSON))
+
+	type rpcQuery struct {
+		name    string
+		chainID int
+		rpcURL  string
+		usdc    common.Address
+	}
+
+	// Build query list from registry + Arc.
+	var queries []rpcQuery
+	if loadedRegistry != nil {
+		for _, rc := range loadedRegistry.Chains {
+			if rc.RPC == "" {
+				continue
+			}
+			for _, t := range rc.Tokens {
+				if t.Symbol == "USDC" {
+					queries = append(queries, rpcQuery{
+						name:    rc.Name,
+						chainID: rc.ChainID,
+						rpcURL:  rc.RPC,
+						usdc:    common.HexToAddress(t.Address),
+					})
+					break
+				}
+			}
+		}
+	}
+	queries = append(queries, rpcQuery{
+		name:    "Arc Testnet",
+		chainID: int(merx.ArcChainID),
+		rpcURL:  merx.ArcRPCURL,
+		usdc:    merx.TestnetUSDC[merx.ArcDomain],
+	})
+
+	// Query all chains in parallel.
+	type result struct {
+		cb  chainBalance
+		err error
+	}
+	ch := make(chan result, len(queries))
+
+	for _, q := range queries {
+		go func(q rpcQuery) {
+			ethClient, err := ethclient.DialContext(ctx, q.rpcURL)
+			if err != nil {
+				ch <- result{err: err}
+				return
+			}
+			defer ethClient.Close()
+
+			contract := bind.NewBoundContract(q.usdc, balABI, ethClient, ethClient, ethClient)
+			var out []interface{}
+			err = contract.Call(&bind.CallOpts{Context: ctx}, &out, "balanceOf", s.signer)
+			if err != nil {
+				ch <- result{err: err}
+				return
+			}
+
+			bal := out[0].(*big.Int)
+			ch <- result{cb: chainBalance{
+				Chain:   q.name,
+				ChainID: q.chainID,
+				Balance: bal.String(),
+			}}
+		}(q)
+	}
+
+	var balances []chainBalance
+	var total big.Int
+	for range queries {
+		res := <-ch
+		if res.err != nil {
+			log.Printf("[merchant-balances] query error: %v", res.err)
+			continue
+		}
+		balances = append(balances, res.cb)
+		bal, _ := new(big.Int).SetString(res.cb.Balance, 10)
+		if bal != nil {
+			total.Add(&total, bal)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"merchant": s.signer.Hex(),
+		"total":    total.String(),
+		"balances": balances,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -440,41 +548,40 @@ func (s *server) handlePayInvoice(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("invoice paid: id=%s txHash=%s chain=%d amount=%s", id, req.TxHash, inv.ChainID, inv.Amount)
 
-	// Deposit received USDC into Gateway in the background.
-	go s.depositToGateway(inv.ChainID, inv.Amount)
+	// Bridge received USDC to Arc via CCTPv2 in the background.
+	go s.bridgeToArc(inv.ChainID, inv.Amount)
 
 	writeJSON(w, http.StatusOK, inv)
 }
 
-// depositToGateway bridges USDC to Arc via CCTPv2 and deposits into Gateway.
+// bridgeToArc bridges USDC to Arc via CCTPv2.
 //
 // Flow:
 //  1. USDC.approve(TokenMessengerV2, amount) on source chain
-//  2. TokenMessengerV2.depositForBurn(amount, arcDomain, ArcReceiver, USDC, ...) on source chain
-//  3. pollAndRelay() — polls CCTP attestation API
-//  4. relayOnArc() — calls ArcReceiver.relayAndDeposit() on Arc
-func (s *server) depositToGateway(chainID int, amountStr string) {
+//  2. TokenMessengerV2.depositForBurn(amount, arcDomain, ...) on source chain
+//  3. pollAndRelay() — polls CCTP attestation API, relays on Arc
+func (s *server) bridgeToArc(chainID int, amountStr string) {
 	rc := registryChainByID(chainID)
 	if rc == nil || rc.RPC == "" {
-		log.Printf("[gateway-deposit] no RPC for chain %d, skipping", chainID)
+		log.Printf("[cctp-bridge] no RPC for chain %d, skipping", chainID)
 		return
 	}
 
 	domain, ok := merx.ChainIDToDomain[uint64(chainID)]
 	if !ok {
-		log.Printf("[gateway-deposit] no CCTP domain for chain %d, skipping", chainID)
+		log.Printf("[cctp-bridge] no CCTP domain for chain %d, skipping", chainID)
 		return
 	}
 
 	cctpUSDC, ok := merx.TestnetUSDC[domain]
 	if !ok {
-		log.Printf("[gateway-deposit] no CCTP USDC for domain %d", domain)
+		log.Printf("[cctp-bridge] no CCTP USDC for domain %d", domain)
 		return
 	}
 
 	amount, ok := new(big.Int).SetString(amountStr, 10)
 	if !ok || amount.Sign() <= 0 {
-		log.Printf("[gateway-deposit] invalid amount: %s", amountStr)
+		log.Printf("[cctp-bridge] invalid amount: %s", amountStr)
 		return
 	}
 
@@ -483,27 +590,27 @@ func (s *server) depositToGateway(chainID int, amountStr string) {
 
 	ethClient, err := ethclient.DialContext(ctx, rc.RPC)
 	if err != nil {
-		log.Printf("[gateway-deposit] dial RPC: %v", err)
+		log.Printf("[cctp-bridge] dial RPC: %v", err)
 		return
 	}
 	defer ethClient.Close()
 
 	chainIDBig, err := ethClient.ChainID(ctx)
 	if err != nil {
-		log.Printf("[gateway-deposit] get chain ID: %v", err)
+		log.Printf("[cctp-bridge] get chain ID: %v", err)
 		return
 	}
 
-	auth, err := bind.NewKeyedTransactorWithChainID(s.client.Key(), chainIDBig)
+	auth, err := bind.NewKeyedTransactorWithChainID(s.key, chainIDBig)
 	if err != nil {
-		log.Printf("[gateway-deposit] create transactor: %v", err)
+		log.Printf("[cctp-bridge] create transactor: %v", err)
 		return
 	}
 	auth.Context = ctx
 
-	tokenMessenger := common.HexToAddress("0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA")
-	// ArcReceiver is the mintRecipient on Arc — it receives the CCTP mint then deposits into Gateway.
-	mintRecipient := common.BytesToHash(merx.ArcReceiver.Bytes()) // left-pad to bytes32
+	tokenMessenger := merx.TokenMessengerV2
+	// Mint directly to the merchant wallet on Arc.
+	mintRecipient := addressToBytes32(s.signer)
 
 	erc20ABI, _ := abi.JSON(strings.NewReader(`[{"type":"function","name":"approve","inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[{"type":"bool"}]}]`))
 	depositForBurnABI, _ := abi.JSON(strings.NewReader(`[{"type":"function","name":"depositForBurn","inputs":[{"name":"amount","type":"uint256"},{"name":"destinationDomain","type":"uint32"},{"name":"mintRecipient","type":"bytes32"},{"name":"burnToken","type":"address"},{"name":"destinationCaller","type":"bytes32"},{"name":"maxFee","type":"uint256"},{"name":"minFinalityThreshold","type":"uint32"}],"outputs":[]}]`))
@@ -511,24 +618,24 @@ func (s *server) depositToGateway(chainID int, amountStr string) {
 	// Step 1: approve TokenMessengerV2 to spend USDC.
 	approveData, err := erc20ABI.Pack("approve", tokenMessenger, amount)
 	if err != nil {
-		log.Printf("[gateway-deposit] pack approve: %v", err)
+		log.Printf("[cctp-bridge] pack approve: %v", err)
 		return
 	}
 
 	approveTx, err := bind.NewBoundContract(cctpUSDC, erc20ABI, ethClient, ethClient, ethClient).RawTransact(auth, approveData)
 	if err != nil {
-		log.Printf("[gateway-deposit] approve tx: %v", err)
+		log.Printf("[cctp-bridge] approve tx: %v", err)
 		return
 	}
-	log.Printf("[gateway-deposit] approve broadcast: %s", approveTx.Hash().Hex())
+	log.Printf("[cctp-bridge] approve broadcast: %s", approveTx.Hash().Hex())
 
 	receipt, err := bind.WaitMined(ctx, ethClient, approveTx)
 	if err != nil {
-		log.Printf("[gateway-deposit] approve wait: %v", err)
+		log.Printf("[cctp-bridge] approve wait: %v", err)
 		return
 	}
 	if receipt.Status != 1 {
-		log.Printf("[gateway-deposit] approve reverted")
+		log.Printf("[cctp-bridge] approve reverted")
 		return
 	}
 
@@ -543,29 +650,29 @@ func (s *server) depositToGateway(chainID int, amountStr string) {
 		uint32(0),          // minFinalityThreshold = 0 (fast transfer)
 	)
 	if err != nil {
-		log.Printf("[gateway-deposit] pack depositForBurn: %v", err)
+		log.Printf("[cctp-bridge] pack depositForBurn: %v", err)
 		return
 	}
 
 	auth.Nonce = nil // fresh nonce after approve
 	burnTx, err := bind.NewBoundContract(tokenMessenger, depositForBurnABI, ethClient, ethClient, ethClient).RawTransact(auth, burnData)
 	if err != nil {
-		log.Printf("[gateway-deposit] depositForBurn tx: %v", err)
+		log.Printf("[cctp-bridge] depositForBurn tx: %v", err)
 		return
 	}
-	log.Printf("[gateway-deposit] depositForBurn broadcast: %s on domain %d", burnTx.Hash().Hex(), domain)
+	log.Printf("[cctp-bridge] depositForBurn broadcast: %s on domain %d", burnTx.Hash().Hex(), domain)
 
 	receipt, err = bind.WaitMined(ctx, ethClient, burnTx)
 	if err != nil {
-		log.Printf("[gateway-deposit] depositForBurn wait: %v", err)
+		log.Printf("[cctp-bridge] depositForBurn wait: %v", err)
 		return
 	}
 	if receipt.Status != 1 {
-		log.Printf("[gateway-deposit] depositForBurn reverted")
+		log.Printf("[cctp-bridge] depositForBurn reverted")
 		return
 	}
 
-	log.Printf("[gateway-deposit] CCTP burn complete, polling attestation...")
+	log.Printf("[cctp-bridge] CCTP burn complete, polling attestation...")
 
 	// Step 3+4: poll CCTP attestation, then self-relay on Arc.
 	// Reuse the existing pollAndRelay which calls relayOnArc.
@@ -710,46 +817,6 @@ func (s *server) handleBalances(w http.ResponseWriter, r *http.Request) {
 		"token":   usdc.Hex(),
 		"chain":   "arc",
 		"balance": balance.String(),
-	})
-}
-
-// GET /api/gateway/balances — merchant's unified Gateway balance across all domains.
-func (s *server) handleGatewayBalances(w http.ResponseWriter, r *http.Request) {
-	bal, err := s.client.GetBalances(r.Context(), &gateway.BalancesRequest{
-		Token:   "USDC",
-		Sources: []gateway.BalanceSource{{Depositor: s.client.SignerAddress().Hex()}},
-	})
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "GetBalances: %v", err)
-		return
-	}
-
-	// Sum total and include per-domain breakdown.
-	type domainBalance struct {
-		Domain  uint32 `json:"domain"`
-		Chain   string `json:"chain,omitempty"`
-		Balance string `json:"balance"`
-	}
-	var total float64
-	var domains []domainBalance
-	for _, b := range bal.Balances {
-		f, _ := strconv.ParseFloat(b.Balance, 64)
-		total += f
-		chainName := ""
-		if d := s.info.LookupDomain(b.Domain); d != nil {
-			chainName = d.Chain + " " + d.Network
-		}
-		domains = append(domains, domainBalance{
-			Domain:  b.Domain,
-			Chain:   chainName,
-			Balance: b.Balance,
-		})
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"depositor": s.client.SignerAddress().Hex(),
-		"total":     fmt.Sprintf("%.6f", total),
-		"domains":   domains,
 	})
 }
 
