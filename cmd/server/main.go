@@ -124,6 +124,22 @@ func usdcAddressForChain(chainID int) string {
 	return ""
 }
 
+func registryChainByID(chainID int) *registryChain {
+	if loadedRegistry == nil {
+		return nil
+	}
+	for i := range loadedRegistry.Chains {
+		if loadedRegistry.Chains[i].ChainID == chainID {
+			return &loadedRegistry.Chains[i]
+		}
+	}
+	return nil
+}
+
+func registryChainByIDUint64(chainID uint64) *registryChain {
+	return registryChainByID(int(chainID))
+}
+
 // ---------------------------------------------------------------------------
 // Invoice store
 // ---------------------------------------------------------------------------
@@ -842,7 +858,8 @@ func (s *server) handlePayTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, ok := merx.ChainIDToDomain[chainID]; !ok {
+	rc := registryChainByIDUint64(chainID)
+	if rc == nil {
 		writeError(w, http.StatusBadRequest, "unsupported chain_id: %d", chainID)
 		return
 	}
@@ -859,12 +876,12 @@ func (s *server) handlePayTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	domain := merx.ChainIDToDomain[chainID]
-	usdc, ok := merx.TestnetUSDC[domain]
-	if !ok {
-		writeError(w, http.StatusBadRequest, "no USDC address for domain %d", domain)
+	usdcAddr := usdcAddressForChain(int(chainID))
+	if usdcAddr == "" {
+		writeError(w, http.StatusBadRequest, "no USDC address for chain %d", chainID)
 		return
 	}
+	usdc := common.HexToAddress(usdcAddr)
 
 	// Deadline: 1 hour from now.
 	deadline := big.NewInt(time.Now().Add(1 * time.Hour).Unix())
@@ -930,11 +947,12 @@ func (s *server) handlePay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rpcURL, ok := merx.RPCURLs[req.ChainID]
-	if !ok {
+	payRC := registryChainByIDUint64(req.ChainID)
+	if payRC == nil || payRC.RPC == "" {
 		writeError(w, http.StatusBadRequest, "no RPC URL for chain_id %d", req.ChainID)
 		return
 	}
+	rpcURL := payRC.RPC
 
 	amount, ok := new(big.Int).SetString(req.Amount, 10)
 	if !ok || amount.Sign() <= 0 {
@@ -1011,7 +1029,11 @@ func (s *server) handlePay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	txHash := tx.Hash().Hex()
-	sourceDomain := merx.ChainIDToDomain[req.ChainID]
+	payChain := registryChainByIDUint64(req.ChainID)
+	sourceDomain := uint32(0)
+	if payChain != nil {
+		sourceDomain = uint32(payChain.CCTPDomain)
+	}
 
 	// Create invoice now that the tx is broadcast.
 	amountHuman := fmt.Sprintf("%.2f", float64(amount.Int64())/1_000_000)
@@ -1218,17 +1240,18 @@ func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dstDomain, ok := merx.ChainIDToDomain[req.ChainID]
-	if !ok {
+	dstRC := registryChainByIDUint64(req.ChainID)
+	if dstRC == nil {
 		writeError(w, http.StatusBadRequest, "unsupported chainId: %d", req.ChainID)
 		return
 	}
+	dstDomain := uint32(dstRC.CCTPDomain)
 
-	dstRPC, ok := merx.RPCURLs[req.ChainID]
-	if !ok {
+	if dstRC.RPC == "" {
 		writeError(w, http.StatusBadRequest, "no RPC URL for chainId %d", req.ChainID)
 		return
 	}
+	dstRPC := dstRC.RPC
 
 	recipient := common.HexToAddress(req.To)
 	ctx := r.Context()
