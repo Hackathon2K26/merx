@@ -41,13 +41,25 @@ export function payInvoice(
   });
 }
 
-// Gateway
-export function getGatewayBalances(): Promise<{
-  depositor: string;
+// Merchant dashboard
+export function getMerchantBalances(): Promise<{
+  merchant: string;
   total: string;
-  domains: Array<{ domain: number; chain: string; balance: string }>;
+  balances: Array<{ chain: string; chainId: number; balance: string }>;
 }> {
-  return request("/api/gateway/balances");
+  return request("/api/merchant/balances");
+}
+
+export function listInvoices(): Promise<Invoice[]> {
+  return request("/api/invoices");
+}
+
+// Sweep (bridge to Sepolia + stake to Compound)
+export function sweep(amount: string): Promise<{ txHash: string }> {
+  return request("/api/sweep", {
+    method: "POST",
+    body: JSON.stringify({ amount }),
+  });
 }
 
 // Uniswap
