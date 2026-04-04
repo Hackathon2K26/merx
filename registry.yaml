@@ -1,10 +1,12 @@
 chains:
   - name: Ethereum Sepolia
     chainId: 11155111
+    gatewayDomain: 0
+    rpc: "https://ethereum-sepolia-rpc.publicnode.com"
     tokens:
       - symbol: USDC
         decimals: 6
-        address: "0x94a9d9ac8a22534e3faca9f4e7f2e2cf85d5e4c8"
+        address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
       - symbol: WETH
         decimals: 18
         address: "0xfff9976782d46cc05630d1f6ebab18b2324d6b14"
@@ -14,6 +16,8 @@ chains:
 
   - name: Base Sepolia
     chainId: 84532
+    gatewayDomain: 6
+    rpc: "https://base-sepolia-rpc.publicnode.com"
     tokens:
       - symbol: USDC
         decimals: 6
@@ -24,6 +28,8 @@ chains:
 
   - name: Unichain Sepolia
     chainId: 1301
+    gatewayDomain: 10
+    rpc: "https://sepolia.unichain.org"
     tokens:
       - symbol: USDC
         decimals: 6
