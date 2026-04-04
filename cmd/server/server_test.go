@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -90,6 +91,28 @@ func TestHandlePayTx(t *testing.T) {
 	}
 	if resp.Approval.Spender == "" {
 		t.Fatal("expected approval spender")
+	}
+}
+
+func TestHandleConfig(t *testing.T) {
+	s := setupServerOffline(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	w := httptest.NewRecorder()
+	s.handleConfig(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Merchant string `json:"merchant"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Merchant == "" {
+		t.Fatal("expected merchant address")
 	}
 }
 
@@ -190,6 +213,57 @@ func TestCORS(t *testing.T) {
 
 		if w.Header().Get("Access-Control-Allow-Origin") != "*" {
 			t.Fatal("missing CORS origin header on normal request")
+		}
+	})
+}
+
+func TestSPAFileHandler(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "index.html"), []byte("index"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "assets"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "assets", "app.js"), []byte("asset"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := spaFileHandler(root)
+
+	t.Run("serves existing asset", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		if body := w.Body.String(); body != "asset" {
+			t.Fatalf("unexpected body: %q", body)
+		}
+	})
+
+	t.Run("falls back to index for app route", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/checkout/mastering-solidity", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		if body := w.Body.String(); body != "index" {
+			t.Fatalf("unexpected body: %q", body)
+		}
+	})
+
+	t.Run("returns 404 for missing asset path with extension", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/assets/missing.js", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404, got %d", w.Code)
 		}
 	})
 }

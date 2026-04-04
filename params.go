@@ -7,7 +7,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// Shop wallet (backend signer). Override with PRIVATE_KEY env or --private-key flag.
+// Shop wallet (backend signer) used by the single-service POC deployment.
 const DefaultPrivateKey = "4c5c7916326aa54e80c39792003ac7d9464b0fb0558678fc16040c9d9322aa41"
 
 // Shop wallet address: 0x2A94238046B648EFF3Ec899fbe6C2B7990C52ca3

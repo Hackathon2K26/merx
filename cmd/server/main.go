@@ -2,8 +2,8 @@
 //
 // Usage:
 //
-//	PRIVATE_KEY=0x... go run cmd/server/main.go
-//	PRIVATE_KEY=0x... go run cmd/server/main.go --port 3001
+//	go run cmd/server/main.go
+//	PORT=3001 go run cmd/server/main.go
 package main
 
 import (
@@ -19,6 +19,8 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,7 +62,6 @@ func loadUniswapConfig(path string) (*uniswapConfig, error) {
 	}
 	return &cfg, nil
 }
-
 
 const depositForBurnABIJSON = `[{"type":"function","name":"depositForBurn","inputs":[{"name":"amount","type":"uint256"},{"name":"destinationDomain","type":"uint32"},{"name":"mintRecipient","type":"bytes32"},{"name":"burnToken","type":"address"},{"name":"destinationCaller","type":"bytes32"},{"name":"maxFee","type":"uint256"},{"name":"minFinalityThreshold","type":"uint32"}],"outputs":[]}]`
 
@@ -317,26 +318,59 @@ func (u *uniswapProxy) forward(w http.ResponseWriter, path string, body []byte) 
 	w.Write(respBody)
 }
 
+func spaFileHandler(root string) http.Handler {
+	fileServer := http.FileServer(http.Dir(root))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
+
+		cleanPath := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		if cleanPath != "" {
+			fullPath := filepath.Join(root, cleanPath)
+			if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+			if filepath.Ext(cleanPath) != "" {
+				http.NotFound(w, r)
+				return
+			}
+		}
+
+		http.ServeFile(w, r, filepath.Join(root, "index.html"))
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
 type server struct {
-	key                        *ecdsa.PrivateKey
-	signer                     common.Address
-	arcOperatorKey             *ecdsa.PrivateKey // operator on ArcReceiver (0x2A94...)
-	depositForBurnABI          abi.ABI
-	depositForBurnWithHookABI  abi.ABI
-	relayAndSupplyABI          abi.ABI
-	invoices                   *invoiceStore
-	uniswap                    *uniswapProxy
+	key                       *ecdsa.PrivateKey
+	signer                    common.Address
+	arcOperatorKey            *ecdsa.PrivateKey // operator on ArcReceiver (0x2A94...)
+	depositForBurnABI         abi.ABI
+	depositForBurnWithHookABI abi.ABI
+	relayAndSupplyABI         abi.ABI
+	invoices                  *invoiceStore
+	uniswap                   *uniswapProxy
 }
 
 func main() {
-	port := flag.Int("port", 8080, "HTTP port")
-	privKeyHex := flag.String("private-key", "", "hex private key (or PRIVATE_KEY env)")
+	portDefault := 8080
+	if portEnv := os.Getenv("PORT"); portEnv != "" {
+		if parsedPort, err := strconv.Atoi(portEnv); err == nil && parsedPort > 0 {
+			portDefault = parsedPort
+		}
+	}
+
+	port := flag.Int("port", portDefault, "HTTP port")
 	uniswapCfgPath := flag.String("uniswap-config", "uniswap-api/config.yaml", "path to uniswap config.yaml")
 	registryPath := flag.String("registry", "registry.yaml", "path to token registry YAML")
+	frontendDistPath := flag.String("frontend-dist", "frontend/dist", "path to built frontend assets")
 	flag.Parse()
 
 	// Load token registry.
@@ -347,15 +381,7 @@ func main() {
 	loadedRegistry = reg
 	log.Printf("loaded %d chains from registry", len(reg.Chains))
 
-	keyHex := *privKeyHex
-	if keyHex == "" {
-		keyHex = os.Getenv("PRIVATE_KEY")
-	}
-	if keyHex == "" {
-		keyHex = merx.DefaultPrivateKey
-	}
-
-	key, err := crypto.HexToECDSA(strings.TrimPrefix(keyHex, "0x"))
+	key, err := crypto.HexToECDSA(strings.TrimPrefix(merx.DefaultPrivateKey, "0x"))
 	if err != nil {
 		log.Fatalf("invalid private key: %v", err)
 	}
@@ -415,6 +441,7 @@ func main() {
 	mux.HandleFunc("POST /api/withdraw", s.handleWithdraw)
 
 	// Chain info.
+	mux.HandleFunc("GET /api/config", s.handleConfig)
 	mux.HandleFunc("GET /api/chains", s.handleChains)
 
 	// Invoice endpoints.
@@ -433,6 +460,14 @@ func main() {
 	mux.HandleFunc("POST /api/uniswap/approval", s.handleUniswapApproval)
 	mux.HandleFunc("POST /api/uniswap/swap", s.handleUniswapSwap)
 
+	// Frontend build for the single-service POC deployment.
+	if _, err := os.Stat(filepath.Join(*frontendDistPath, "index.html")); err == nil {
+		mux.Handle("/", spaFileHandler(*frontendDistPath))
+		log.Printf("frontend enabled from %s", *frontendDistPath)
+	} else {
+		log.Printf("warning: frontend dist not found at %s (%v)", *frontendDistPath, err)
+	}
+
 	log.Printf("signer: %s", signer.Hex())
 	log.Printf("listening on :%d", *port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), logRequests(cors(mux))))
@@ -441,6 +476,12 @@ func main() {
 // ---------------------------------------------------------------------------
 // Chain handler
 // ---------------------------------------------------------------------------
+
+func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"merchant": s.signer.Hex(),
+	})
+}
 
 func (s *server) handleChains(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, loadedRegistry.Chains)
@@ -1011,12 +1052,12 @@ func (s *server) handlePayTx(w http.ResponseWriter, r *http.Request) {
 
 	calldata, err := s.depositForBurnWithHookABI.Pack("depositForBurnWithHook",
 		amount,
-		merx.ArcDomain,    // destinationDomain = Arc
+		merx.ArcDomain, // destinationDomain = Arc
 		mintRecipient,
 		burnToken,
-		zeroCaller,        // destinationCaller = permissionless
+		zeroCaller, // destinationCaller = permissionless
 		maxFee,
-		uint32(0),         // minFinalityThreshold
+		uint32(0), // minFinalityThreshold
 		merx.ForwardingHookData,
 	)
 	if err != nil {
@@ -1186,8 +1227,8 @@ func (s *server) pollRefundCompletion(invoiceID, arcTxHash string) {
 
 		var result struct {
 			Messages []struct {
-				Status       string `json:"status"`
-				ForwardState string `json:"forwardState"`
+				Status        string `json:"status"`
+				ForwardState  string `json:"forwardState"`
 				ForwardTxHash string `json:"forwardTxHash"`
 			} `json:"messages"`
 		}
@@ -1282,7 +1323,6 @@ func (s *server) fetchCCTPAttestation(ctx context.Context, sourceDomain uint32, 
 	m := result.Messages[0]
 	return m.Message, m.Attestation, m.Status, nil
 }
-
 
 type payRequest struct {
 	TxHash      string `json:"txHash"`
@@ -1696,7 +1736,7 @@ func estimateForwardingFee(ctx context.Context, sourceDomain, destDomain uint32,
 	defer resp.Body.Close()
 
 	var fees []struct {
-		FinalityThreshold int `json:"finalityThreshold"`
+		FinalityThreshold int     `json:"finalityThreshold"`
 		MinimumFee        float64 `json:"minimumFee"` // bps
 		ForwardFee        struct {
 			Med int64 `json:"med"`

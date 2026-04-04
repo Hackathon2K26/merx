@@ -18,6 +18,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return data as T;
 }
 
+export function getAppConfig(): Promise<{ merchant: string }> {
+  return request("/api/config");
+}
+
 // Chains
 export function getChains(): Promise<ChainInfo[]> {
   return request("/api/chains");

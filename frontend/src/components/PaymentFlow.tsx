@@ -11,7 +11,7 @@ import {
   useChainId,
   usePublicClient,
 } from "wagmi";
-import { parseAbi, erc20Abi, encodeFunctionData, type Hex } from "viem";
+import { erc20Abi, type Hex } from "viem";
 
 import type { QuoteResponse } from "@/types/uniswap";
 import type { ChainInfo, TokenEntry } from "@/types/chain";
@@ -21,18 +21,7 @@ import { formatUSDC } from "@/lib/format";
 import { ChainSelector } from "./ChainSelector";
 import { TokenSelector } from "./TokenSelector";
 
-const ERC20_ABI = parseAbi([
-  "function transfer(address to, uint256 amount) returns (bool)",
-]);
-
-const DEPOSIT_FOR_BURN_ABI = parseAbi([
-  "function depositForBurnWithHook(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold, bytes hookData)",
-]);
-
 const TOKEN_MESSENGER_V2 = "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA" as Hex;
-const ARC_DOMAIN = 26;
-const FORWARDING_HOOK = "0x636374702d666f72776172640000000000000000000000000000000000000000" as Hex;
-
 
 const PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3" as Hex;
 const MAX_UINT256 = 2n ** 256n - 1n;
@@ -42,11 +31,10 @@ type Step = "idle" | "select-token" | "quote" | "approving-permit2" | "signing-p
 interface Props {
   chains: ChainInfo[];
   product: Product;
-  merchantAddress: string;
   onPaid: () => void;
 }
 
-export function PaymentFlow({ chains, product, merchantAddress, onPaid }: Props) {
+export function PaymentFlow({ chains, product, onPaid }: Props) {
   const { address } = useAccount();
   const currentChainId = useChainId();
   const { switchChain } = useSwitchChain();
@@ -93,8 +81,6 @@ export function PaymentFlow({ chains, product, merchantAddress, onPaid }: Props)
   }
 
   const tokenBalance = selectedToken ? tokenBalances[selectedSymbol] : undefined;
-  const balanceLoading = balancesLoading;
-
   // Swap tokens: non-USDC tokens the user actually holds (balance > 0), on Uniswap-supported chains
   const swapTokens = chain?.uniswapSupported
     ? allTokens.filter((t) => t.symbol !== "USDC" && (tokenBalances[t.symbol] ?? 0n) > 0n)
@@ -113,7 +99,7 @@ export function PaymentFlow({ chains, product, merchantAddress, onPaid }: Props)
   const needsPermit2Approval = !isDirectUSDC && (permit2Allowance === undefined || permit2Allowance === 0n);
 
   // Check CCTP TokenMessenger allowance (for direct USDC payment)
-  const { data: cctpAllowance, refetch: refetchCCTPAllowance } = useReadContract({
+  const { data: cctpAllowance } = useReadContract({
     address: (isDirectUSDC && usdcToken ? usdcToken.address : undefined) as Hex | undefined,
     abi: erc20Abi,
     functionName: "allowance",
@@ -148,7 +134,7 @@ export function PaymentFlow({ chains, product, merchantAddress, onPaid }: Props)
   });
 
   // Direct USDC transfer (legacy, for swap flow)
-  const { writeContract, data: transferHash, isPending: transferPending } = useWriteContract();
+  const { data: transferHash, isPending: transferPending } = useWriteContract();
   const { isSuccess: transferConfirmed, isError: transferReverted } = useWaitForTransactionReceipt({
     hash: transferHash, chainId: selectedChainId || undefined, confirmations: 1, pollingInterval: 4_000,
   });
@@ -280,20 +266,15 @@ export function PaymentFlow({ chains, product, merchantAddress, onPaid }: Props)
   function sendBurnTx(ptx: Awaited<ReturnType<typeof getPayTx>>) {
     if (!address || !publicClient) return;
     setStep("burning");
-    const mintRecipient = ("0x" + merchantAddress.slice(2).toLowerCase().padStart(64, "0")) as Hex;
-    const data = encodeFunctionData({
-      abi: DEPOSIT_FOR_BURN_ABI,
-      functionName: "depositForBurnWithHook",
-      args: [
-        BigInt(amountBaseUnits), ARC_DOMAIN, mintRecipient,
-        ptx.approval.token as Hex,
-        "0x0000000000000000000000000000000000000000000000000000000000000000" as Hex,
-        BigInt(ptx.maxFee), 0, FORWARDING_HOOK,
-      ],
-    });
     publicClient.getTransactionCount({ address }).then((nonce) => {
       sendBurn(
-        { to: TOKEN_MESSENGER_V2, data, value: 0n, nonce, chainId: selectedChainId },
+        {
+          to: ptx.to as Hex,
+          data: ptx.data as Hex,
+          value: BigInt(ptx.value),
+          nonce,
+          chainId: ptx.chain_id,
+        },
         { onError(err) { setError(`Burn TX failed: ${err.message}`); setStep("error"); } },
       );
     }).catch((err) => {

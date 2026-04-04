@@ -1,4 +1,4 @@
-import { http, createConfig, fallback } from "wagmi";
+import { http, createConfig } from "wagmi";
 import { injected } from "wagmi/connectors";
 import { supportedChains } from "./chains";
 

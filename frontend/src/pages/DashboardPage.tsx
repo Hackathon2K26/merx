@@ -2,40 +2,44 @@ import { useState } from "react";
 import { Navigate } from "react-router-dom";
 import { useAccount } from "wagmi";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { getMerchantBalances, listInvoices, supply, withdraw, refund, getChains } from "@/lib/api";
+import { getMerchantBalances, listInvoices, supply, withdraw, refund, getChains, getAppConfig } from "@/lib/api";
 import { shortenAddress, formatUSDC, formatNativeBalance } from "@/lib/format";
 import { chainName, txExplorerURL, arcTxURL } from "@/lib/chains";
 import type { ChainInfo } from "@/types/chain";
 import { chainIcon } from "@/lib/chainIcons";
-import { MERCHANT_ADDRESS } from "@/lib/constants";
 import type { Invoice } from "@/types/invoice";
 
 const ARC_CHAIN_ID = 5042002;
 
 export function DashboardPage() {
   const { address, isConnected } = useAccount();
-  const isMerchant = isConnected && address?.toLowerCase() === MERCHANT_ADDRESS.toLowerCase();
-
-  if (!isMerchant) {
-    return <Navigate to="/" replace />;
-  }
   const queryClient = useQueryClient();
+  const { data: appConfig, isLoading: appConfigLoading, isError: appConfigError } = useQuery({
+    queryKey: ["app-config"],
+    queryFn: getAppConfig,
+    staleTime: Infinity,
+  });
+  const merchantAddress = appConfig?.merchant;
+  const isMerchant = isConnected && !!address && !!merchantAddress && address.toLowerCase() === merchantAddress.toLowerCase();
 
   const { data: balances, isLoading: balancesLoading } = useQuery({
     queryKey: ["merchant-balances"],
     queryFn: getMerchantBalances,
     refetchInterval: 10_000,
+    enabled: isMerchant,
   });
 
   const { data: invoices, isLoading: invoicesLoading } = useQuery({
     queryKey: ["invoices-all"],
     queryFn: listInvoices,
     refetchInterval: 10_000,
+    enabled: isMerchant,
   });
 
   const { data: chains } = useQuery<ChainInfo[]>({
     queryKey: ["chains"],
     queryFn: getChains,
+    enabled: isMerchant,
   });
 
   // Supply state
@@ -56,6 +60,18 @@ export function DashboardPage() {
   const hasArcFunds = arcAmount !== "0";
   const compoundAmount = balances?.compound ?? "0";
   const hasCompoundFunds = compoundAmount !== "0";
+
+  if (appConfigLoading) {
+    return (
+      <div className="max-w-4xl mx-auto py-12 text-center text-muted-foreground">
+        Loading dashboard...
+      </div>
+    );
+  }
+
+  if (appConfigError || !merchantAddress || !isMerchant) {
+    return <Navigate to="/" replace />;
+  }
 
   function humanToBaseUnits(human: string): string {
     if (!human) return "0";

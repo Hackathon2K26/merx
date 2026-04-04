@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useAccount } from "wagmi";
 import { useQuery } from "@tanstack/react-query";
@@ -8,15 +7,10 @@ import { PaymentFlow } from "@/components/PaymentFlow";
 import { ConnectWallet } from "@/components/ConnectWallet";
 import type { ChainInfo } from "@/types/chain";
 
-import { MERCHANT_ADDRESS } from "@/lib/constants";
-
 export function CheckoutPage() {
   const { productId } = useParams<{ productId: string }>();
-  const { address, isConnected } = useAccount();
+  const { isConnected } = useAccount();
   const product = getProduct(productId ?? "");
-
-  const [paid, setPaid] = useState(false);
-  const [error, setError] = useState("");
 
   const { data: chains } = useQuery<ChainInfo[]>({
     queryKey: ["chains"],
@@ -70,12 +64,9 @@ export function CheckoutPage() {
           <PaymentFlow
             chains={chains ?? []}
             product={product}
-            merchantAddress={MERCHANT_ADDRESS}
-            onPaid={() => setPaid(true)}
+            onPaid={() => undefined}
           />
         )}
-
-        {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
     </div>
   );

@@ -1,13 +1,20 @@
 import type { ReactNode } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { useAccount } from "wagmi";
+import { useQuery } from "@tanstack/react-query";
 import { ConnectWallet } from "./ConnectWallet";
-import { MERCHANT_ADDRESS } from "@/lib/constants";
+import { getAppConfig } from "@/lib/api";
 
 export function Layout({ children }: { children: ReactNode }) {
   const location = useLocation();
   const { address } = useAccount();
-  const isMerchant = address?.toLowerCase() === MERCHANT_ADDRESS.toLowerCase();
+  const { data: appConfig } = useQuery({
+    queryKey: ["app-config"],
+    queryFn: getAppConfig,
+    staleTime: Infinity,
+  });
+  const merchantAddress = appConfig?.merchant;
+  const isMerchant = !!address && !!merchantAddress && address.toLowerCase() === merchantAddress.toLowerCase();
 
   return (
     <div className="min-h-screen flex flex-col">
