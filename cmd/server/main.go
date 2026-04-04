@@ -1,4 +1,4 @@
-// Local API server exposing Gateway + Uniswap + Invoice operations for the frontend.
+// Local API server exposing CCTP + Uniswap + Invoice operations for the frontend.
 //
 // Usage:
 //
@@ -22,10 +22,11 @@ import (
 	"sync"
 	"time"
 
+	"crypto/ecdsa"
+
 	merx "github.com/RomainLafont/merx"
 	"gopkg.in/yaml.v3"
 
-	"github.com/RomainLafont/merx/gateway"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -62,10 +63,11 @@ func loadUniswapConfig(path string) (*uniswapConfig, error) {
 	return &cfg, nil
 }
 
-// Testnet-only key. Address: 0x3338A40C3362e6974AA2feCC06a536FF73D6797d
-const defaultPrivateKey = "63de9a8de555c9e160c577087e4d43865f6018aeb5bf919268ed5de5d525a126"
+const depositForBurnABIJSON = `[{"type":"function","name":"depositForBurn","inputs":[{"name":"amount","type":"uint256"},{"name":"destinationDomain","type":"uint32"},{"name":"mintRecipient","type":"bytes32"},{"name":"burnToken","type":"address"},{"name":"destinationCaller","type":"bytes32"},{"name":"maxFee","type":"uint256"},{"name":"minFinalityThreshold","type":"uint32"}],"outputs":[]}]`
 
-const relayAndDepositABIJSON = `[{"type":"function","name":"relayAndDeposit","inputs":[{"name":"message","type":"bytes"},{"name":"attestation","type":"bytes"},{"name":"depositor","type":"address"}],"outputs":[]}]`
+const receiveMessageABIJSON = `[{"type":"function","name":"receiveMessage","inputs":[{"name":"message","type":"bytes"},{"name":"attestation","type":"bytes"}],"outputs":[{"name":"success","type":"bool"}]}]`
+
+const relayAndSupplyABIJSON = `[{"type":"function","name":"relayAndSupply","inputs":[{"name":"message","type":"bytes"},{"name":"attestation","type":"bytes"},{"name":"beneficiary","type":"address"}],"outputs":[]}]`
 
 // ---------------------------------------------------------------------------
 // Token registry (loaded from registry.yaml)
@@ -214,12 +216,14 @@ func (u *uniswapProxy) forward(w http.ResponseWriter, path string, body []byte) 
 // ---------------------------------------------------------------------------
 
 type server struct {
-	client         *gateway.Client
-	info           *gateway.InfoResponse
-	paymasterABI   abi.ABI
-	arcReceiverABI abi.ABI
-	invoices       *invoiceStore
-	uniswap        *uniswapProxy
+	key                  *ecdsa.PrivateKey
+	signer               common.Address
+	paymasterABI         abi.ABI
+	depositForBurnABI    abi.ABI
+	receiveMessageABI    abi.ABI
+	relayAndSupplyABI    abi.ABI
+	invoices             *invoiceStore
+	uniswap              *uniswapProxy
 }
 
 func main() {
@@ -250,24 +254,23 @@ func main() {
 		log.Fatalf("invalid private key: %v", err)
 	}
 
-	client, err := gateway.NewClient(gateway.Config{PrivateKey: key})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Pre-fetch info at startup.
-	info, err := client.GetInfo(context.Background())
-	if err != nil {
-		log.Fatalf("GetInfo: %v", err)
-	}
+	signer := crypto.PubkeyToAddress(key.PublicKey)
 
 	paymasterABI, err := abi.JSON(strings.NewReader(payWithPermitABIJSON))
 	if err != nil {
 		log.Fatalf("parse paymaster ABI: %v", err)
 	}
-	arcReceiverABI, err := abi.JSON(strings.NewReader(relayAndDepositABIJSON))
+	depositForBurnABI, err := abi.JSON(strings.NewReader(depositForBurnABIJSON))
 	if err != nil {
-		log.Fatalf("parse merx.ArcReceiver ABI: %v", err)
+		log.Fatalf("parse depositForBurn ABI: %v", err)
+	}
+	receiveMessageABI, err := abi.JSON(strings.NewReader(receiveMessageABIJSON))
+	if err != nil {
+		log.Fatalf("parse receiveMessage ABI: %v", err)
+	}
+	relayAndSupplyABI, err := abi.JSON(strings.NewReader(relayAndSupplyABIJSON))
+	if err != nil {
+		log.Fatalf("parse relayAndSupply ABI: %v", err)
 	}
 
 	// Uniswap proxy.
@@ -282,23 +285,24 @@ func main() {
 	}
 
 	s := &server{
-		client:         client,
-		info:           info,
-		paymasterABI:   paymasterABI,
-		arcReceiverABI: arcReceiverABI,
-		invoices:       newInvoiceStore(),
-		uniswap:        uniProxy,
+		key:               key,
+		signer:            signer,
+		paymasterABI:      paymasterABI,
+		depositForBurnABI: depositForBurnABI,
+		receiveMessageABI: receiveMessageABI,
+		relayAndSupplyABI: relayAndSupplyABI,
+		invoices:          newInvoiceStore(),
+		uniswap:           uniProxy,
 	}
 
 	mux := http.NewServeMux()
 
-	// Gateway endpoints.
-	mux.HandleFunc("GET /api/info", s.handleInfo)
+	// CCTP endpoints.
 	mux.HandleFunc("GET /api/balances", s.handleBalances)
 	mux.HandleFunc("GET /api/pay-tx", s.handlePayTx)
 	mux.HandleFunc("POST /api/pay", s.handlePay)
 	mux.HandleFunc("POST /api/refund", s.handleRefund)
-	mux.HandleFunc("GET /api/refund/{id}", s.handleRefundStatus)
+	mux.HandleFunc("POST /api/sweep", s.handleSweep)
 
 	// Chain info.
 	mux.HandleFunc("GET /api/chains", s.handleChains)
@@ -314,7 +318,7 @@ func main() {
 	mux.HandleFunc("POST /api/uniswap/approval", s.handleUniswapApproval)
 	mux.HandleFunc("POST /api/uniswap/swap", s.handleUniswapSwap)
 
-	log.Printf("signer: %s", client.SignerAddress())
+	log.Printf("signer: %s", signer.Hex())
 	log.Printf("listening on :%d", *port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), logRequests(cors(mux))))
 }
@@ -506,29 +510,53 @@ func (s *server) handleUniswapSwap(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Gateway handlers
+// CCTP V2 helpers
 // ---------------------------------------------------------------------------
 
-func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
-	info, err := s.client.GetInfo(r.Context())
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "GetInfo: %v", err)
-		return
-	}
-	s.info = info
-	writeJSON(w, http.StatusOK, info)
+// addressToBytes32 left-pads an address to 32 bytes for CCTP mintRecipient.
+func addressToBytes32(addr common.Address) [32]byte {
+	var b [32]byte
+	copy(b[12:], addr.Bytes())
+	return b
 }
 
+// balanceOfABIJSON is the ERC-20 balanceOf selector.
+const balanceOfABIJSON = `[{"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],"outputs":[{"name":"","type":"uint256"}]}]`
+
+// GET /api/balances — query USDC.balanceOf(shopWallet) on Arc.
 func (s *server) handleBalances(w http.ResponseWriter, r *http.Request) {
-	bal, err := s.client.GetBalances(r.Context(), &gateway.BalancesRequest{
-		Token:   "USDC",
-		Sources: []gateway.BalanceSource{{Depositor: s.client.SignerAddress().Hex()}},
-	})
+	ctx := r.Context()
+
+	ethClient, err := ethclient.DialContext(ctx, merx.ArcRPCURL)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "GetBalances: %v", err)
+		writeError(w, http.StatusBadGateway, "dial Arc RPC: %v", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, bal)
+	defer ethClient.Close()
+
+	balABI, err := abi.JSON(strings.NewReader(balanceOfABIJSON))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "parse balanceOf ABI: %v", err)
+		return
+	}
+
+	usdc := merx.TestnetUSDC[merx.ArcDomain]
+	contract := bind.NewBoundContract(usdc, balABI, ethClient, ethClient, ethClient)
+
+	var out []interface{}
+	err = contract.Call(&bind.CallOpts{Context: ctx}, &out, "balanceOf", s.signer)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "balanceOf: %v", err)
+		return
+	}
+
+	balance := out[0].(*big.Int)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"wallet":  s.signer.Hex(),
+		"token":   usdc.Hex(),
+		"chain":   "arc",
+		"balance": balance.String(),
+	})
 }
 
 // GET /api/pay-tx?chain_id=1301&amount=1000000 — returns the permit data
@@ -708,7 +736,7 @@ func (s *server) handlePay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth, err := bind.NewKeyedTransactorWithChainID(s.client.Key(), chainIDBig)
+	auth, err := bind.NewKeyedTransactorWithChainID(s.key, chainIDBig)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create transactor: %v", err)
 		return
@@ -726,7 +754,7 @@ func (s *server) handlePay(w http.ResponseWriter, r *http.Request) {
 	sourceDomain := merx.ChainIDToDomain[req.ChainID]
 	log.Printf("payment broadcast: tx=%s owner=%s chain=%d amount=%s", txHash, req.Owner, req.ChainID, req.Amount)
 
-	// Background: poll CCTP attestation, then self-relay on Arc.
+	// Background: poll CCTP attestation, then self-relay receiveMessage on Arc.
 	go s.pollAndRelay(sourceDomain, txHash)
 
 	writeJSON(w, http.StatusCreated, payResponse{
@@ -735,53 +763,59 @@ func (s *server) handlePay(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// pollAndRelay waits for the CCTP attestation, then self-relays on Arc
-// (receiveMessage + depositFor in one tx via ArcReceiver).
+// pollAndRelay waits for the CCTP attestation, then calls
+// MessageTransmitter.receiveMessage on Arc to mint USDC to the shop wallet.
 func (s *server) pollAndRelay(sourceDomain uint32, txHash string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	log.Printf("[relay] waiting for CCTP attestation: domain=%d tx=%s", sourceDomain, txHash)
 
-	// Poll CCTP attestation API until status = complete.
+	message, attestation, err := s.pollCCTPAttestation(ctx, sourceDomain, txHash)
+	if err != nil {
+		log.Printf("[relay] %v", err)
+		return
+	}
+
+	// Self-relay on Arc: call MessageTransmitter.receiveMessage.
+	relayTx, err := s.relayCCTP(ctx, merx.ArcRPCURL, big.NewInt(merx.ArcChainID), merx.MessageTransmitter, message, attestation)
+	if err != nil {
+		log.Printf("[relay] ERROR: %v", err)
+		return
+	}
+	log.Printf("[relay] receiveMessage on Arc: tx=%s (source tx=%s)", relayTx, txHash)
+}
+
+// pollCCTPAttestation polls the CCTP attestation API until status=complete,
+// returning the raw message and attestation hex strings.
+func (s *server) pollCCTPAttestation(ctx context.Context, sourceDomain uint32, txHash string) (string, string, error) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	var message, attestation string
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[relay] timeout waiting for attestation: tx=%s", txHash)
-			return
+			return "", "", fmt.Errorf("timeout waiting for attestation: tx=%s", txHash)
 		case <-ticker.C:
 		}
 
-		msg, att, status, err := s.getCCTPAttestation(ctx, sourceDomain, txHash)
+		msg, att, status, err := s.fetchCCTPAttestation(ctx, sourceDomain, txHash)
 		if err != nil {
-			log.Printf("[relay] poll error: %v", err)
+			log.Printf("[cctp] poll error: %v", err)
 			continue
 		}
 		if status == "" {
 			continue // not found yet
 		}
-		log.Printf("[relay] status: %s", status)
+		log.Printf("[cctp] status=%s tx=%s", status, txHash)
 		if status == "complete" {
-			message = msg
-			attestation = att
-			break
+			return msg, att, nil
 		}
 	}
-
-	// Self-relay on Arc: receiveMessage + depositFor in one tx.
-	if err := s.relayOnArc(ctx, message, attestation); err != nil {
-		log.Printf("[relay] ERROR: %v", err)
-		return
-	}
-	log.Printf("[relay] deposit into Gateway complete: tx=%s", txHash)
 }
 
-// getCCTPAttestation polls the CCTP attestation API and returns (message, attestation, status).
-func (s *server) getCCTPAttestation(ctx context.Context, sourceDomain uint32, txHash string) (string, string, string, error) {
+// fetchCCTPAttestation makes a single request to the CCTP attestation API.
+func (s *server) fetchCCTPAttestation(ctx context.Context, sourceDomain uint32, txHash string) (string, string, string, error) {
 	url := fmt.Sprintf("%s/%d?transactionHash=%s", merx.CCTPAttestationURL, sourceDomain, txHash)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -816,42 +850,42 @@ func (s *server) getCCTPAttestation(ctx context.Context, sourceDomain uint32, tx
 	return m.Message, m.Attestation, m.Status, nil
 }
 
-// relayOnArc calls ArcReceiver.relayAndDeposit(message, attestation, shopAddress) on Arc.
-func (s *server) relayOnArc(ctx context.Context, message, attestation string) error {
+// relayCCTP calls MessageTransmitter.receiveMessage on the given chain.
+// Returns the relay tx hash.
+func (s *server) relayCCTP(ctx context.Context, rpcURL string, chainID *big.Int, transmitter common.Address, message, attestation string) (string, error) {
 	msgBytes, err := hexutil.Decode(message)
 	if err != nil {
-		return fmt.Errorf("decode message: %w", err)
+		return "", fmt.Errorf("decode message: %w", err)
 	}
 	attBytes, err := hexutil.Decode(attestation)
 	if err != nil {
-		return fmt.Errorf("decode attestation: %w", err)
+		return "", fmt.Errorf("decode attestation: %w", err)
 	}
 
-	calldata, err := s.arcReceiverABI.Pack("relayAndDeposit", msgBytes, attBytes, s.client.SignerAddress())
+	calldata, err := s.receiveMessageABI.Pack("receiveMessage", msgBytes, attBytes)
 	if err != nil {
-		return fmt.Errorf("pack relayAndDeposit: %w", err)
+		return "", fmt.Errorf("pack receiveMessage: %w", err)
 	}
 
-	ethClient, err := ethclient.DialContext(ctx, merx.ArcRPCURL)
+	ethClient, err := ethclient.DialContext(ctx, rpcURL)
 	if err != nil {
-		return fmt.Errorf("dial Arc RPC: %w", err)
+		return "", fmt.Errorf("dial RPC: %w", err)
 	}
 	defer ethClient.Close()
 
-	auth, err := bind.NewKeyedTransactorWithChainID(s.client.Key(), big.NewInt(merx.ArcChainID))
+	auth, err := bind.NewKeyedTransactorWithChainID(s.key, chainID)
 	if err != nil {
-		return fmt.Errorf("create transactor: %w", err)
+		return "", fmt.Errorf("create transactor: %w", err)
 	}
 	auth.Context = ctx
 
-	contract := bind.NewBoundContract(merx.ArcReceiver, s.arcReceiverABI, ethClient, ethClient, ethClient)
+	contract := bind.NewBoundContract(transmitter, s.receiveMessageABI, ethClient, ethClient, ethClient)
 	tx, err := contract.RawTransact(auth, calldata)
 	if err != nil {
-		return fmt.Errorf("broadcast relayAndDeposit: %w", err)
+		return "", fmt.Errorf("broadcast receiveMessage: %w", err)
 	}
 
-	log.Printf("[relay] Arc tx broadcast: %s", tx.Hash().Hex())
-	return nil
+	return tx.Hash().Hex(), nil
 }
 
 type payRequest struct {
@@ -868,14 +902,13 @@ type payResponse struct {
 }
 
 type refundRequest struct {
-	To     string `json:"to"`
-	Chain  uint32 `json:"chain"`
-	Amount string `json:"amount"`
+	To      string `json:"to"`
+	ChainID uint64 `json:"chainId"`
+	Amount  string `json:"amount"`
 }
 
 type refundResponse struct {
-	TransferID string       `json:"transferId"`
-	Fees       gateway.Fees `json:"fees"`
+	TxHash string `json:"txHash"`
 }
 
 func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
@@ -885,8 +918,8 @@ func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.To == "" || req.Chain == 0 || req.Amount == "" {
-		writeError(w, http.StatusBadRequest, "to, chain, and amount are required")
+	if req.To == "" || req.ChainID == 0 || req.Amount == "" {
+		writeError(w, http.StatusBadRequest, "to, chainId, and amount are required")
 		return
 	}
 
@@ -896,188 +929,265 @@ func (s *server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dstDomain, ok := merx.ChainIDToDomain[req.ChainID]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "unsupported chainId: %d", req.ChainID)
+		return
+	}
+
+	dstRPC, ok := merx.RPCURLs[req.ChainID]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "no RPC URL for chainId %d", req.ChainID)
+		return
+	}
+
 	recipient := common.HexToAddress(req.To)
 	ctx := r.Context()
 
-	bal, err := s.client.GetBalances(ctx, &gateway.BalancesRequest{
-		Token:   "USDC",
-		Sources: []gateway.BalanceSource{{Depositor: s.client.SignerAddress().Hex()}},
-	})
+	// Check shop USDC balance on Arc.
+	arcBalance, err := s.getArcUSDCBalance(ctx)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "GetBalances: %v", err)
+		writeError(w, http.StatusBadGateway, "check balance: %v", err)
+		return
+	}
+	if arcBalance.Cmp(amount) < 0 {
+		writeError(w, http.StatusConflict, "insufficient USDC on Arc: have %s, need %s", arcBalance, amount)
 		return
 	}
 
-	allocs := gateway.AllocateBalances(bal.Balances, amount, req.Chain, -1)
-	if allocs == nil {
-		writeError(w, http.StatusConflict, "insufficient Gateway balance for %s USDC", amount)
+	// depositForBurn on Arc → customer's chain.
+	mintRecipient := addressToBytes32(recipient)
+	burnToken := merx.TestnetUSDC[merx.ArcDomain]
+	var zeroCaller [32]byte
+
+	calldata, err := s.depositForBurnABI.Pack("depositForBurn",
+		amount,
+		dstDomain,
+		mintRecipient,
+		burnToken,
+		zeroCaller,
+		merx.DefaultMaxFee,
+		uint32(0), // minFinalityThreshold
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "pack depositForBurn: %v", err)
 		return
 	}
 
-	dstDomain := s.info.LookupDomain(req.Chain)
-	if dstDomain == nil {
-		writeError(w, http.StatusBadRequest, "destination domain %d not found", req.Chain)
+	ethClient, err := ethclient.DialContext(ctx, merx.ArcRPCURL)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "dial Arc RPC: %v", err)
+		return
+	}
+	defer ethClient.Close()
+
+	auth, err := bind.NewKeyedTransactorWithChainID(s.key, big.NewInt(merx.ArcChainID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "create transactor: %v", err)
+		return
+	}
+	auth.Context = ctx
+
+	contract := bind.NewBoundContract(merx.TokenMessengerV2, s.depositForBurnABI, ethClient, ethClient, ethClient)
+	tx, err := contract.RawTransact(auth, calldata)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "broadcast depositForBurn: %v", err)
 		return
 	}
 
-	dstUSDC, ok := merx.TestnetUSDC[req.Chain]
-	if !ok {
-		writeError(w, http.StatusBadRequest, "no known USDC address for domain %d", req.Chain)
-		return
-	}
+	txHash := tx.Hash().Hex()
+	log.Printf("refund started: tx=%s to=%s chain=%d amount=%s", txHash, req.To, req.ChainID, req.Amount)
 
-	var intents []gateway.BurnIntent
-	for _, a := range allocs {
-		srcDomain := s.info.LookupDomain(a.Domain)
-		if srcDomain == nil {
-			writeError(w, http.StatusInternalServerError, "source domain %d not found", a.Domain)
-			return
-		}
-		srcUSDC, ok := merx.TestnetUSDC[a.Domain]
-		if !ok {
-			writeError(w, http.StatusInternalServerError, "no USDC address for domain %d", a.Domain)
-			return
-		}
+	// Background: poll CCTP attestation, then self-relay receiveMessage on destination.
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
 
-		spec, err := s.client.BuildTransferSpec(gateway.TransferSpecParams{
-			SourceDomain:      a.Domain,
-			DestinationDomain: req.Chain,
-			SourceWallet:      common.HexToAddress(srcDomain.WalletContract.Address),
-			DestinationMinter: common.HexToAddress(dstDomain.MinterContract.Address),
-			SourceToken:       srcUSDC,
-			DestinationToken:  dstUSDC,
-			Depositor:         s.client.SignerAddress(),
-			Recipient:         recipient,
-			Value:             a.Amount,
-		})
+		message, attestation, err := s.pollCCTPAttestation(bgCtx, merx.ArcDomain, txHash)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "BuildTransferSpec: %v", err)
+			log.Printf("[refund-relay] %v", err)
 			return
 		}
-		intents = append(intents, gateway.BurnIntent{Spec: *spec})
-	}
 
-	// Estimate (no forwarding — self-relay).
-	est, err := s.client.Estimate(ctx, intents, nil)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "Estimate: %v", err)
-		return
-	}
-
-	var signed []gateway.SignedBurnIntentRequest
-	for i := range est.Body {
-		filled := est.Body[i].BurnIntent
-		sig, err := s.client.SignBurnIntent(&filled)
+		relayTx, err := s.relayCCTP(bgCtx, dstRPC, new(big.Int).SetUint64(req.ChainID), merx.MessageTransmitter, message, attestation)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "SignBurnIntent: %v", err)
+			log.Printf("[refund-relay] ERROR: %v", err)
 			return
 		}
-		signed = append(signed, gateway.SignedBurnIntentRequest{
-			BurnIntent: &filled,
-			Signature:  hexutil.Encode(sig),
-		})
-	}
+		log.Printf("[refund-relay] receiveMessage: tx=%s (burn tx=%s)", relayTx, txHash)
+	}()
 
-	// Transfer (no forwarding — self-relay).
-	resp, err := s.client.Transfer(ctx, signed, nil)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "Transfer: %v", err)
-		return
-	}
-
-	log.Printf("refund started: id=%s to=%s chain=%d amount=%s", resp.TransferID, req.To, req.Chain, req.Amount)
-
-	// Resolve destination RPC for self-relay mint.
-	dstChainID := domainToChainID(req.Chain)
-	dstRPC := merx.RPCURLs[dstChainID]
-	minterAddr := common.HexToAddress(dstDomain.MinterContract.Address)
-
-	// Background: poll for attestation, then self-relay gatewayMint on destination.
-	go s.pollAndMint(resp.TransferID, dstRPC, minterAddr)
-
-	writeJSON(w, http.StatusCreated, refundResponse{
-		TransferID: resp.TransferID,
-		Fees:       resp.Fees,
-	})
+	writeJSON(w, http.StatusCreated, refundResponse{TxHash: txHash})
 }
 
-func (s *server) handleRefundStatus(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		writeError(w, http.StatusBadRequest, "missing transfer id")
+// POST /api/sweep — sweep USDC from Arc into Compound V3 on Ethereum Sepolia.
+func (s *server) handleSweep(w http.ResponseWriter, r *http.Request) {
+	var req sweepRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: %v", err)
 		return
 	}
 
-	status, err := s.client.GetTransferStatus(r.Context(), id)
+	if req.Amount == "" {
+		writeError(w, http.StatusBadRequest, "amount is required")
+		return
+	}
+
+	amount, ok := new(big.Int).SetString(req.Amount, 10)
+	if !ok || amount.Sign() <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid amount: %s", req.Amount)
+		return
+	}
+
+	if merx.CompoundDepositor == (common.Address{}) {
+		writeError(w, http.StatusBadRequest, "CompoundDepositor not deployed")
+		return
+	}
+
+	ctx := r.Context()
+	const dstDomainID uint32 = 0 // Ethereum Sepolia
+
+	// Check shop USDC balance on Arc.
+	arcBalance, err := s.getArcUSDCBalance(ctx)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "GetTransferStatus: %v", err)
+		writeError(w, http.StatusBadGateway, "check balance: %v", err)
+		return
+	}
+	if arcBalance.Cmp(amount) < 0 {
+		writeError(w, http.StatusConflict, "insufficient USDC on Arc: have %s, need %s", arcBalance, amount)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, status)
-}
+	// depositForBurn on Arc → Ethereum Sepolia, mintRecipient = CompoundDepositor.
+	mintRecipient := addressToBytes32(merx.CompoundDepositor)
+	burnToken := merx.TestnetUSDC[merx.ArcDomain]
+	var zeroCaller [32]byte
 
-// pollAndMint polls Gateway transfer status until the attestation is available,
-// then self-relays gatewayMint on the destination chain.
-func (s *server) pollAndMint(transferID, rpcURL string, minterAddr common.Address) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	log.Printf("[refund-relay] waiting for attestation: id=%s", transferID)
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("[refund-relay] timeout: id=%s", transferID)
-			return
-		case <-ticker.C:
-		}
-
-		status, err := s.client.GetTransferStatus(ctx, transferID)
-		if err != nil {
-			log.Printf("[refund-relay] poll error: %v", err)
-			continue
-		}
-
-		if status.Attestation == nil {
-			continue
-		}
-
-		log.Printf("[refund-relay] attestation ready, submitting gatewayMint")
-
-		attPayload, err := hexutil.Decode(status.Attestation.Payload)
-		if err != nil {
-			log.Printf("[refund-relay] decode attestation payload: %v", err)
-			return
-		}
-		attSig, err := hexutil.Decode(status.Attestation.Signature)
-		if err != nil {
-			log.Printf("[refund-relay] decode attestation signature: %v", err)
-			return
-		}
-
-		txHash, err := s.client.SubmitMint(ctx, rpcURL, minterAddr, attPayload, attSig)
-		if err != nil {
-			log.Printf("[refund-relay] gatewayMint failed: %v", err)
-			return
-		}
-
-		log.Printf("[refund-relay] gatewayMint broadcast: tx=%s id=%s", txHash.Hex(), transferID)
+	calldata, err := s.depositForBurnABI.Pack("depositForBurn",
+		amount,
+		dstDomainID,
+		mintRecipient,
+		burnToken,
+		zeroCaller,
+		merx.DefaultMaxFee,
+		uint32(0), // minFinalityThreshold
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "pack depositForBurn: %v", err)
 		return
 	}
+
+	ethClient, err := ethclient.DialContext(ctx, merx.ArcRPCURL)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "dial Arc RPC: %v", err)
+		return
+	}
+	defer ethClient.Close()
+
+	auth, err := bind.NewKeyedTransactorWithChainID(s.key, big.NewInt(merx.ArcChainID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "create transactor: %v", err)
+		return
+	}
+	auth.Context = ctx
+
+	contract := bind.NewBoundContract(merx.TokenMessengerV2, s.depositForBurnABI, ethClient, ethClient, ethClient)
+	tx, err := contract.RawTransact(auth, calldata)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "broadcast depositForBurn: %v", err)
+		return
+	}
+
+	txHash := tx.Hash().Hex()
+	log.Printf("sweep started: tx=%s amount=%s → Compound V3", txHash, req.Amount)
+
+	// Background: poll CCTP attestation, then call CompoundDepositor.relayAndSupply on Ethereum Sepolia.
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		message, attestation, err := s.pollCCTPAttestation(bgCtx, merx.ArcDomain, txHash)
+		if err != nil {
+			log.Printf("[sweep] %v", err)
+			return
+		}
+
+		msgBytes, err := hexutil.Decode(message)
+		if err != nil {
+			log.Printf("[sweep] decode message: %v", err)
+			return
+		}
+		attBytes, err := hexutil.Decode(attestation)
+		if err != nil {
+			log.Printf("[sweep] decode attestation: %v", err)
+			return
+		}
+
+		supplyCalldata, err := s.relayAndSupplyABI.Pack("relayAndSupply", msgBytes, attBytes, s.signer)
+		if err != nil {
+			log.Printf("[sweep] pack relayAndSupply: %v", err)
+			return
+		}
+
+		rpcURL := merx.RPCURLs[11155111]
+		sepoliaClient, err := ethclient.DialContext(bgCtx, rpcURL)
+		if err != nil {
+			log.Printf("[sweep] dial Sepolia RPC: %v", err)
+			return
+		}
+		defer sepoliaClient.Close()
+
+		supplyAuth, err := bind.NewKeyedTransactorWithChainID(s.key, big.NewInt(11155111))
+		if err != nil {
+			log.Printf("[sweep] create transactor: %v", err)
+			return
+		}
+		supplyAuth.Context = bgCtx
+
+		depositorContract := bind.NewBoundContract(merx.CompoundDepositor, s.relayAndSupplyABI, sepoliaClient, sepoliaClient, sepoliaClient)
+		supplyTx, err := depositorContract.RawTransact(supplyAuth, supplyCalldata)
+		if err != nil {
+			log.Printf("[sweep] relayAndSupply failed: %v", err)
+			return
+		}
+
+		log.Printf("[sweep] relayAndSupply broadcast: tx=%s (burn tx=%s)", supplyTx.Hash().Hex(), txHash)
+	}()
+
+	writeJSON(w, http.StatusCreated, sweepResponse{TxHash: txHash})
 }
 
-// domainToChainID returns the EVM chain ID for a CCTP domain.
-func domainToChainID(domain uint32) uint64 {
-	for chainID, d := range merx.ChainIDToDomain {
-		if d == domain {
-			return chainID
-		}
+type sweepRequest struct {
+	Amount string `json:"amount"`
+}
+
+type sweepResponse struct {
+	TxHash string `json:"txHash"`
+}
+
+// getArcUSDCBalance returns the shop wallet's USDC balance on Arc.
+func (s *server) getArcUSDCBalance(ctx context.Context) (*big.Int, error) {
+	ethClient, err := ethclient.DialContext(ctx, merx.ArcRPCURL)
+	if err != nil {
+		return nil, fmt.Errorf("dial Arc RPC: %w", err)
 	}
-	return 0
+	defer ethClient.Close()
+
+	balABI, err := abi.JSON(strings.NewReader(balanceOfABIJSON))
+	if err != nil {
+		return nil, fmt.Errorf("parse balanceOf ABI: %w", err)
+	}
+
+	usdc := merx.TestnetUSDC[merx.ArcDomain]
+	contract := bind.NewBoundContract(usdc, balABI, ethClient, ethClient, ethClient)
+
+	var out []interface{}
+	err = contract.Call(&bind.CallOpts{Context: ctx}, &out, "balanceOf", s.signer)
+	if err != nil {
+		return nil, fmt.Errorf("balanceOf: %w", err)
+	}
+
+	return out[0].(*big.Int), nil
 }
 
 // ---------------------------------------------------------------------------

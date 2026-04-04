@@ -6,29 +6,21 @@ import {ShopPaymaster} from "../src/ShopPaymaster.sol";
 
 /// @notice Deploy ShopPaymaster on a source chain.
 ///
-///   forge script script/DeployShopPaymaster.s.sol \
-///     --rpc-url https://sepolia.unichain.org --broadcast
-///
-/// Environment:
-///   PRIVATE_KEY — deployer key
-///   USDC        — (optional) override USDC address
-///   TOKEN_MESSENGER — (optional) override TokenMessengerV2 address
+///   PRIVATE_KEY=0x... forge script script/DeployShopPaymaster.s.sol \
+///     --rpc-url https://sepolia.unichain.org --broadcast --skip-simulation
 contract DeployShopPaymaster is Script {
-    // Defaults (testnets).
     address constant TOKEN_MESSENGER_V2 = 0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA;
-    // mintRecipient = ArcDepositor on Arc (receives USDC from CCTP, then flushes to Gateway).
-    // mintRecipient = ArcReceiver on Arc (receives CCTP mint, then deposits to Gateway).
-    address constant ARC_RECEIVER = 0x0A4eFeFbB7286D864cDDf6957642b2B11cd58f30;
+    // Shop wallet on Arc — CCTP mints USDC directly here.
+    address constant SHOP_WALLET = 0x2A94238046B648EFF3Ec899fbe6C2B7990C52ca3;
     uint32 constant ARC_DOMAIN = 26;
 
-    // USDC by chain ID.
     function _usdc() internal view returns (address) {
         address env = vm.envOr("USDC", address(0));
         if (env != address(0)) return env;
         uint256 chainId = block.chainid;
-        if (chainId == 1301) return 0x31d0220469e10c4E71834a79b1f276d740d3768F;   // Unichain Sepolia
-        if (chainId == 84532) return 0x036CbD53842c5426634e7929541eC2318f3dCF7e;  // Base Sepolia
-        if (chainId == 11155111) return 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238; // Ethereum Sepolia
+        if (chainId == 1301) return 0x31d0220469e10c4E71834a79b1f276d740d3768F;
+        if (chainId == 84532) return 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
+        if (chainId == 11155111) return 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238;
         revert("unsupported chain - set USDC env var");
     }
 
@@ -38,13 +30,13 @@ contract DeployShopPaymaster is Script {
         address messenger = vm.envOr("TOKEN_MESSENGER", TOKEN_MESSENGER_V2);
 
         vm.startBroadcast(deployerKey);
-        ShopPaymaster paymaster = new ShopPaymaster(usdc, messenger, ARC_DOMAIN, ARC_RECEIVER);
+        ShopPaymaster paymaster = new ShopPaymaster(usdc, messenger, ARC_DOMAIN, SHOP_WALLET);
         vm.stopBroadcast();
 
         console.log("ShopPaymaster deployed at:", address(paymaster));
         console.log("  USDC:", usdc);
         console.log("  TokenMessenger:", messenger);
         console.log("  Arc domain:", ARC_DOMAIN);
-        console.log("  Arc receiver (mintRecipient):", ARC_RECEIVER);
+        console.log("  mintRecipient (shop wallet):", SHOP_WALLET);
     }
 }

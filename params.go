@@ -10,14 +10,16 @@ import (
 // Shop wallet (backend signer). Override with PRIVATE_KEY env or --private-key flag.
 const DefaultPrivateKey = "4c5c7916326aa54e80c39792003ac7d9464b0fb0558678fc16040c9d9322aa41"
 
+// Shop wallet address: 0x2A94238046B648EFF3Ec899fbe6C2B7990C52ca3
+
 // ---------------------------------------------------------------------------
 // CCTP domains & chain IDs
 // ---------------------------------------------------------------------------
 
-// ChainIDToDomain maps EVM chain IDs to CCTP domain IDs.
 var ChainIDToDomain = map[uint64]uint32{
-	84532: 6,  // Base Sepolia
-	1301:  10, // Unichain Sepolia
+	11155111: 0,  // Ethereum Sepolia
+	84532:    6,  // Base Sepolia
+	1301:     10, // Unichain Sepolia
 }
 
 // ---------------------------------------------------------------------------
@@ -25,10 +27,18 @@ var ChainIDToDomain = map[uint64]uint32{
 // ---------------------------------------------------------------------------
 
 var TestnetUSDC = map[uint32]common.Address{
+	0:  common.HexToAddress("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"), // Ethereum Sepolia
 	6:  common.HexToAddress("0x036CbD53842c5426634e7929541eC2318f3dCF7e"), // Base Sepolia
 	10: common.HexToAddress("0x31d0220469e10c4E71834a79b1f276d740d3768F"), // Unichain Sepolia
 	26: common.HexToAddress("0x3600000000000000000000000000000000000000"), // Arc Testnet
 }
+
+// ---------------------------------------------------------------------------
+// CCTP V2 contracts (same on all testnets)
+// ---------------------------------------------------------------------------
+
+var TokenMessengerV2 = common.HexToAddress("0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA")
+var MessageTransmitter = common.HexToAddress("0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275")
 
 // ---------------------------------------------------------------------------
 // Deployed contracts
@@ -36,23 +46,26 @@ var TestnetUSDC = map[uint32]common.Address{
 
 // ShopPaymaster addresses by EVM chain ID (one per source chain).
 var ShopPaymaster = map[uint64]common.Address{
-	1301: common.HexToAddress("0xb0262c0Cb99329706126Cae0f152C575067e450a"), // Unichain Sepolia
+	1301: common.HexToAddress("0xF9b392b25eA1a7671C4badB0E356cc5457AdC47a"), // Unichain Sepolia
 }
 
-// ArcReceiver on Arc testnet — self-relays CCTP messages and deposits into Gateway.
-var ArcReceiver = common.HexToAddress("0x0A4eFeFbB7286D864cDDf6957642b2B11cd58f30")
+// CompoundDepositor on Ethereum Sepolia — CCTP receiveMessage + supply into Compound V3.
+// Will be updated after redeployment with new CCTP-based contract.
+var CompoundDepositor = common.HexToAddress("0x832705f381957C8218d7ae8B20A10d510B5AFB75")
 
 // ---------------------------------------------------------------------------
 // RPC endpoints
 // ---------------------------------------------------------------------------
 
 var RPCURLs = map[uint64]string{
-	1301:  "https://sepolia.unichain.org",
-	84532: "https://sepolia.base.org",
+	11155111: "https://ethereum-sepolia-rpc.publicnode.com",
+	1301:     "https://sepolia.unichain.org",
+	84532:    "https://sepolia.base.org",
 }
 
 const ArcRPCURL = "https://rpc.testnet.arc.network"
-const ArcChainID = 5042002
+const ArcChainID int64 = 5042002
+const ArcDomain uint32 = 26
 
 // ---------------------------------------------------------------------------
 // CCTP API
@@ -61,5 +74,10 @@ const ArcChainID = 5042002
 const CCTPAttestationURL = "https://iris-api-sandbox.circle.com/v2/messages"
 
 // DefaultMaxFee for CCTP V2 Fast Transfer (USDC, 6 decimals).
-// Unichain: 1.5 bps. For 100 USDC = $0.015. $0.05 with margin.
-var DefaultMaxFee = big.NewInt(50_000)
+var DefaultMaxFee = big.NewInt(50_000) // $0.05
+
+// ---------------------------------------------------------------------------
+// Compound V3 (Ethereum Sepolia)
+// ---------------------------------------------------------------------------
+
+var CompoundComet = common.HexToAddress("0xAec1F48e02Cfb822Be958B68C7957156EB3F0b6e")
