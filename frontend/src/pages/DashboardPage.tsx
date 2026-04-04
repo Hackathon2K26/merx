@@ -2,9 +2,11 @@ import { useState } from "react";
 import { Navigate } from "react-router-dom";
 import { useAccount } from "wagmi";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { getMerchantBalances, listInvoices, sweep } from "@/lib/api";
+import { getMerchantBalances, listInvoices, sweep, getChains } from "@/lib/api";
 import { shortenAddress, formatUSDC } from "@/lib/format";
 import { chainName } from "@/lib/chains";
+import type { ChainInfo } from "@/types/chain";
+import { chainIcon } from "@/lib/chainIcons";
 import { MERCHANT_ADDRESS } from "@/lib/constants";
 import type { Invoice } from "@/types/invoice";
 
@@ -30,6 +32,16 @@ export function DashboardPage() {
     queryFn: listInvoices,
     refetchInterval: 10_000,
   });
+
+  const { data: chainsData } = useQuery<ChainInfo[]>({
+    queryKey: ["chains"],
+    queryFn: getChains,
+  });
+
+  function explorerTxUrl(chainId: number, txHash: string): string | undefined {
+    const c = chainsData?.find((ch) => ch.chainId === chainId);
+    return c?.explorer ? `${c.explorer}/tx/${txHash}` : undefined;
+  }
 
   const [sweeping, setSweeping] = useState(false);
   const [sweepResult, setSweepResult] = useState<string | null>(null);
@@ -91,9 +103,12 @@ export function DashboardPage() {
                   key={b.chainId}
                   className="rounded-lg border border-border bg-card p-4 flex items-center justify-between"
                 >
-                  <div>
-                    <p className="font-medium text-sm">{b.chain}</p>
-                    <p className="text-xs text-muted-foreground">Chain ID: {b.chainId}</p>
+                  <div className="flex items-center gap-3">
+                    {chainIcon(b.chainId) && <img src={chainIcon(b.chainId)} alt="" className="h-6 w-6 rounded-full" />}
+                    <div>
+                      <p className="font-medium text-sm">{b.chain}</p>
+                      <p className="text-xs text-muted-foreground">Chain ID: {b.chainId}</p>
+                    </div>
                   </div>
                   <span className={`text-lg font-bold ${isZero ? "text-muted-foreground" : "text-foreground"}`}>
                     {human}
@@ -132,7 +147,10 @@ export function DashboardPage() {
 
         {sweepResult && (
           <div className="rounded-md border border-success/30 bg-success/5 p-3 text-sm text-success">
-            Sweep initiated! TX: <span className="font-mono">{shortenAddress(sweepResult)}</span>
+            Sweep initiated!{" "}
+            <a href={`https://testnet.explorer.arc.network/tx/${sweepResult}`} target="_blank" rel="noopener noreferrer" className="underline font-mono hover:opacity-80">
+              View transaction
+            </a>
             <br />
             <span className="text-xs">CCTP bridging in progress. Funds will appear in Compound after attestation (~5 min).</span>
           </div>
@@ -157,7 +175,7 @@ export function DashboardPage() {
               .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
               .slice(0, 10)
               .map((inv) => (
-                <InvoiceRow key={inv.id} invoice={inv} />
+                <InvoiceRow key={inv.id} invoice={inv} explorerTxUrl={explorerTxUrl} />
               ))}
           </div>
         )}
@@ -166,7 +184,9 @@ export function DashboardPage() {
   );
 }
 
-function InvoiceRow({ invoice }: { invoice: Invoice }) {
+function InvoiceRow({ invoice, explorerTxUrl }: { invoice: Invoice; explorerTxUrl: (chainId: number, txHash: string) => string | undefined }) {
+  const txUrl = invoice.txHash ? explorerTxUrl(invoice.chainId, invoice.txHash) : undefined;
+
   return (
     <div className="rounded-lg border border-border bg-card px-4 py-3 flex items-center justify-between text-sm">
       <div className="flex items-center gap-3">
@@ -182,10 +202,17 @@ function InvoiceRow({ invoice }: { invoice: Invoice }) {
         <span className="text-muted-foreground">{invoice.description}</span>
       </div>
       <div className="flex items-center gap-4">
-        <span className="text-muted-foreground text-xs">{chainName(invoice.chainId)}</span>
+        <span className="flex items-center gap-1 text-muted-foreground text-xs">
+          {chainIcon(invoice.chainId) && <img src={chainIcon(invoice.chainId)} alt="" className="h-3.5 w-3.5 rounded-full" />}
+          {chainName(invoice.chainId)}
+        </span>
         <span className="font-semibold">{invoice.amountHuman} USDC</span>
         {invoice.txHash && (
-          <span className="font-mono text-xs text-muted-foreground">{shortenAddress(invoice.txHash)}</span>
+          txUrl ? (
+            <a href={txUrl} target="_blank" rel="noopener noreferrer" className="font-mono text-xs text-primary hover:underline">{shortenAddress(invoice.txHash)}</a>
+          ) : (
+            <span className="font-mono text-xs text-muted-foreground">{shortenAddress(invoice.txHash)}</span>
+          )
         )}
       </div>
     </div>
