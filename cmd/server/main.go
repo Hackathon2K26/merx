@@ -1074,7 +1074,7 @@ func (s *server) handlePayTx(w http.ResponseWriter, r *http.Request) {
 		Approval: approvalData{
 			Spender: merx.TokenMessengerV2.Hex(),
 			Token:   usdcAddr,
-			Amount:  amount.String(),
+			Amount:  new(big.Int).Add(amount, maxFee).String(), // amount + maxFee (CCTP transfers both)
 		},
 	})
 }

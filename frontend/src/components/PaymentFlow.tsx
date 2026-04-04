@@ -98,17 +98,17 @@ export function PaymentFlow({ chains, product, onPaid }: Props) {
 
   const needsPermit2Approval = !isDirectUSDC && (permit2Allowance === undefined || permit2Allowance === 0n);
 
-  // Check CCTP TokenMessenger allowance (for direct USDC payment)
+  // Check CCTP TokenMessenger allowance (needed for both direct USDC and post-swap bridge)
   const { data: cctpAllowance } = useReadContract({
-    address: (isDirectUSDC && usdcToken ? usdcToken.address : undefined) as Hex | undefined,
+    address: (usdcToken ? usdcToken.address : undefined) as Hex | undefined,
     abi: erc20Abi,
     functionName: "allowance",
     args: address ? [address, TOKEN_MESSENGER_V2] : undefined,
     chainId: selectedChainId || undefined,
-    query: { enabled: !!address && isDirectUSDC && !!usdcToken?.address && selectedChainId > 0 },
+    query: { enabled: !!address && !!usdcToken?.address && selectedChainId > 0 },
   });
 
-  const needsCCTPApproval = isDirectUSDC && (cctpAllowance === undefined || cctpAllowance < BigInt(amountBaseUnits));
+  const needsCCTPApproval = cctpAllowance === undefined || cctpAllowance < BigInt(amountBaseUnits);
 
   // Permit2 ERC-20 approval TX
   const {
@@ -272,6 +272,7 @@ export function PaymentFlow({ chains, product, onPaid }: Props) {
           to: ptx.to as Hex,
           data: ptx.data as Hex,
           value: BigInt(ptx.value),
+          gas: 15_000_000n, // skip RPC gas estimation
           nonce,
           chainId: ptx.chain_id,
         },
