@@ -252,24 +252,18 @@ export function PaymentFlow({ chains, product, onPaid }: Props) {
   }, [address, selectedToken, isDirectUSDC, selectedChainId]);
 
   function sendBurnTx(ptx: Awaited<ReturnType<typeof getPayTx>>) {
-    if (!address || !publicClient) return;
+    if (!address) return;
     setStep("burning");
-    publicClient.getTransactionCount({ address, blockTag: "pending" }).then((nonce) => {
-      sendBurn(
-        {
-          to: ptx.to as Hex,
-          data: ptx.data as Hex,
-          value: BigInt(ptx.value),
-          gas: 400_000n, // enough for depositForBurnWithHook (~200k actual)
-          nonce,
-          chainId: ptx.chain_id,
-        },
-        { onError(err) { setError(`Burn TX failed: ${err.message}`); setStep("error"); } },
-      );
-    }).catch((err) => {
-      setError(`Failed: ${err.message}`);
-      setStep("error");
-    });
+    sendBurn(
+      {
+        to: ptx.to as Hex,
+        data: ptx.data as Hex,
+        value: BigInt(ptx.value),
+        gas: 400_000n, // enough for depositForBurnWithHook (~200k actual)
+        chainId: ptx.chain_id,
+      },
+      { onError(err) { setError(`Burn TX failed: ${err.message}`); setStep("error"); } },
+    );
   }
 
   async function doCCTPPayment() {
