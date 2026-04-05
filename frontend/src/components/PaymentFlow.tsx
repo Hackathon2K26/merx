@@ -158,14 +158,28 @@ export function PaymentFlow({ chains, product, onPaid }: Props) {
     if (burnReverted && step === "burning") { setError("CCTP burn reverted."); setStep("error"); }
   }, [burnReverted, step]);
 
-  // After CCTP approve confirmed → wait for state propagation then send burn tx
-  useEffect(() => {
-    if (cctpApproveConfirmed && payTxData && step === "approving-cctp") {
-      // Wait 3s for RPC state propagation (MetaMask simulates against latest state).
-      const timer = setTimeout(() => sendBurnTx(payTxData), 3000);
-      return () => clearTimeout(timer);
+  // Poll getTransactionCount until the RPC reflects the confirmed tx's nonce.
+  // Returns the next nonce to use, so callers can pass it explicitly.
+  async function waitForNonceSync(txHash: Hex): Promise<number | undefined> {
+    if (!publicClient || !address) return undefined;
+    const tx = await publicClient.getTransaction({ hash: txHash });
+    const expectedNonce = tx.nonce + 1;
+    for (let i = 0; i < 20; i++) {
+      const current = await publicClient.getTransactionCount({ address });
+      if (current >= expectedNonce) return current;
+      await new Promise((r) => setTimeout(r, 500));
     }
-  }, [cctpApproveConfirmed, payTxData, step]);
+    return expectedNonce;
+  }
+
+  // After CCTP approve confirmed → wait for nonce sync then send burn tx
+  useEffect(() => {
+    if (cctpApproveConfirmed && cctpApproveHash && payTxData && step === "approving-cctp") {
+      let cancelled = false;
+      waitForNonceSync(cctpApproveHash).then((nonce) => { if (!cancelled) sendBurnTx(payTxData, nonce); });
+      return () => { cancelled = true; };
+    }
+  }, [cctpApproveConfirmed, cctpApproveHash, payTxData, step]);
 
   // After burn confirmed → report to backend
   useEffect(() => {
@@ -201,12 +215,14 @@ export function PaymentFlow({ chains, product, onPaid }: Props) {
     if (permitSignature && step === "signing-permit") { executeSwapWithPermit(permitSignature); }
   }, [permitSignature, step]);
 
-  // After swap confirmed -> trigger CCTP payment
+  // After swap confirmed -> wait for nonce sync then trigger CCTP payment
   useEffect(() => {
-    if (swapConfirmed && step === "swapping") {
-      doCCTPPayment();
+    if (swapConfirmed && swapHash && step === "swapping") {
+      let cancelled = false;
+      waitForNonceSync(swapHash).then((nonce) => { if (!cancelled) doCCTPPayment(nonce); });
+      return () => { cancelled = true; };
     }
-  }, [swapConfirmed, step]);
+  }, [swapConfirmed, swapHash, step]);
 
   // After USDC transfer confirmed (legacy flow) -> done
   useEffect(() => {
@@ -251,7 +267,7 @@ export function PaymentFlow({ chains, product, onPaid }: Props) {
     }
   }, [address, selectedToken, isDirectUSDC, selectedChainId]);
 
-  function sendBurnTx(ptx: Awaited<ReturnType<typeof getPayTx>>) {
+  function sendBurnTx(ptx: Awaited<ReturnType<typeof getPayTx>>, nonce?: number) {
     if (!address) return;
     setStep("burning");
     sendBurn(
@@ -261,12 +277,13 @@ export function PaymentFlow({ chains, product, onPaid }: Props) {
         value: BigInt(ptx.value),
         gas: 400_000n, // enough for depositForBurnWithHook (~200k actual)
         chainId: ptx.chain_id,
+        ...(nonce != null && { nonce }),
       },
       { onError(err) { setError(`Burn TX failed: ${err.message}`); setStep("error"); } },
     );
   }
 
-  async function doCCTPPayment() {
+  async function doCCTPPayment(nonce?: number) {
     if (!usdcToken || !address) return;
     setError("");
     try {
@@ -280,6 +297,7 @@ export function PaymentFlow({ chains, product, onPaid }: Props) {
         abi: erc20Abi,
         functionName: "approve",
         args: [ptx.approval.spender as Hex, BigInt(ptx.approval.amount)],
+        ...(nonce != null && { nonce }),
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to prepare payment");
@@ -399,7 +417,7 @@ export function PaymentFlow({ chains, product, onPaid }: Props) {
           {isDirectUSDC ? (
             <div className="space-y-2">
               <button
-                onClick={doCCTPPayment}
+                onClick={() => doCCTPPayment()}
                 disabled={cctpApprovePending || burnPending}
                 className="w-full rounded-md bg-[#2775CA] px-4 py-2.5 text-sm font-medium text-white hover:bg-[#2775CA]/90 disabled:opacity-50 transition-colors flex items-center justify-center gap-2"
               >
